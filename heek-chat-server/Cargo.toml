@@ -6,5 +6,18 @@ edition = "2024"
 [dependencies]
 heek-chat-lib = { path = "../heek-chat-lib" }
 serde = { version = "1", features = ["derive"] }
-tarpc = { version = "0.37.0", features = ["serde-transport", "tokio1"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tarpc = { version = "0.37.0", features = ["serde-transport", "tokio1", "tcp"] }
+tokio-serde = { version = "0.9", features = ["cbor"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+] }
+tokio-postgres = { version = "0.7" }
+tokio-tungstenite = "0.26"
+futures = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"

@@ -5,8 +5,17 @@ edition = "2024"
 
 [dependencies]
 aegis = "0.9.3"
+eframe = { version = "0.33.0", default-features = true }
 egui = { version = "0.33.0", features = ["serde"] }
 heek-chat-lib = { path = "../heek-chat-lib" }
 serde = { version = "1", features = ["derive"] }
-tarpc = { version = "0.37.0", features = ["serde-transport", "tokio1"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tarpc = { version = "0.37.0", features = ["serde-transport", "tokio1", "tcp"] }
+tokio-serde = { version = "0.9", features = ["cbor"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
