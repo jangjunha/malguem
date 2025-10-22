@@ -5,7 +5,6 @@
 #### User
 
 * Username
-* Nickname
 * Profile Image (under 5MiB)
 
 #### Channels

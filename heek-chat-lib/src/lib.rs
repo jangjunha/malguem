@@ -1,18 +1,24 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PaginationDirection {
+    Before(u64),
+    After(Option<u64>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pagination {
+    pub direction: PaginationDirection,
+    pub limit: u64,
+}
 
 // User types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub user_id: String,
     pub username: String,
-    pub nickname: String,
     pub profile_image: Option<Vec<u8>>, // Under 5MiB
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserAuth {
-    pub user_id: String,
-    pub firebase_token: String,
 }
 
 // Channel types
@@ -30,14 +36,12 @@ pub struct Channel {
     pub member_ids: Vec<String>,
 }
 
-// Message types
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextMessage {
-    pub message_id: String,
-    pub channel_id: String,
+pub struct Message {
+    pub cursor: u64,
     pub sender_id: String,
     pub content: Vec<u8>, // E2E encrypted with server key
-    pub timestamp: u64,
+    pub timestamp: DateTime<Utc>,
 }
 
 // Voice call types
@@ -82,46 +86,54 @@ pub enum SignalingMessage {
 #[tarpc::service]
 pub trait ChatService {
     // User operations
-    async fn register_user(
-        auth: UserAuth,
+    async fn join(
+        id_token: String,
+        invitation_token: String,
         username: String,
-        nickname: String,
-    ) -> Result<User, String>;
-    async fn get_user(user_id: String) -> Result<User, String>;
+    ) -> Result<String, String>;
+    async fn get_me(id_token: String) -> Result<User, String>;
+    async fn get_user(id_token: String, user_id: String) -> Result<User, String>;
     async fn update_profile(
-        user_id: String,
-        nickname: Option<String>,
+        id_token: String,
+        username: Option<String>,
         profile_image: Option<Vec<u8>>,
     ) -> Result<(), String>;
 
     // Channel operations
     async fn create_channel(
-        creator_id: String,
+        id_token: String,
         name: String,
         visibility: ChannelVisibility,
     ) -> Result<Channel, String>;
-    async fn list_channels(user_id: String) -> Result<Vec<Channel>, String>;
-    async fn join_channel(user_id: String, channel_id: String) -> Result<(), String>;
-    async fn leave_channel(user_id: String, channel_id: String) -> Result<(), String>;
+    async fn list_channels(id_token: String) -> Result<Vec<Channel>, String>;
+    async fn join_channel(id_token: String, channel_id: String) -> Result<(), String>;
+    async fn leave_channel(id_token: String, channel_id: String) -> Result<(), String>;
     async fn invite_to_channel(
-        inviter_id: String,
+        id_token: String,
         invitee_id: String,
         channel_id: String,
     ) -> Result<(), String>;
 
     // Message operations
-    async fn send_message(message: TextMessage) -> Result<(), String>;
-    async fn get_messages(
+    async fn send_message(
+        id_token: String,
         channel_id: String,
-        user_id: String,
-        limit: u32,
-    ) -> Result<Vec<TextMessage>, String>;
+        content: Vec<u8>,
+    ) -> Result<(), String>;
+    async fn get_messages(
+        id_token: String,
+        channel_id: String,
+        pagination: Pagination,
+    ) -> Result<Vec<Message>, String>;
 
     // Voice call operations
     async fn start_voice_call(
+        id_token: String,
         channel_id: String,
-        initiator_id: String,
     ) -> Result<VoiceCallSession, String>;
-    async fn get_voice_call(channel_id: String) -> Result<Option<VoiceCallSession>, String>;
-    async fn end_voice_call(channel_id: String, user_id: String) -> Result<(), String>;
+    async fn get_voice_call(
+        id_token: String,
+        channel_id: String,
+    ) -> Result<Option<VoiceCallSession>, String>;
+    async fn end_voice_call(id_token: String, channel_id: String) -> Result<(), String>;
 }
