@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["heek-chat-desktop", "heek-chat-lib", "heek-chat-server"]
