@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-stream = "0.3.6"
+bytes = "1"
 chrono = { version = "0.4.42", features = ["serde"] }
+futures = "0.3"
+pin-project = "1.0"
 serde = { version = "1", features = ["derive"] }
 tarpc = { version = "0.37.0", features = ["serde1"] }
+tokio = { version = "1", features = ["time", "sync"] }
+tokio-util = { version = "0.7.3", features = ["time"] }
+tokio-serde = { version = "0.9" }
+tokio-tungstenite = "0.26"
+tracing = "0.1"
+uuid = { version = "1.18.1", features = ["serde"] }

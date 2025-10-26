@@ -10,7 +10,12 @@ egui = { version = "0.33.0", features = ["serde"] }
 heek-chat-lib = { path = "../heek-chat-lib" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tarpc = { version = "0.37.0", features = ["serde-transport", "tokio1", "tcp"] }
+tarpc = { version = "0.37.0", features = [
+    "serde-transport",
+    "serde1",
+    "tokio1",
+    "tcp",
+] }
 tokio-serde = { version = "0.9", features = ["cbor"] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -25,3 +30,6 @@ url = "2"
 tiny_http = "0.12"
 urlencoding = "2"
 webbrowser = "1"
+tokio-tungstenite = "0.26"
+futures = "0.3"
+serde_cbor = "0.11"

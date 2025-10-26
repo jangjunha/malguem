@@ -1,11 +1,43 @@
 use eframe::egui;
-use heek_chat_lib::*;
-use std::{collections::HashMap, sync::Arc};
+use heek_chat_lib::{Channel, ChannelID, ChatServiceClient, Event, Message, User};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 mod firebase_auth;
 use firebase_auth::FirebaseAuth;
 
-struct HeekChatApp {
+use crate::connection::Connection;
+
+mod connection;
+mod rtc;
+
+struct CurrentMessageChannel {
+    channel_id: ChannelID,
+    messages: Vec<Message>,
+}
+
+impl CurrentMessageChannel {
+    fn new(channel_id: &ChannelID) -> Self {
+        Self {
+            channel_id: channel_id.clone(),
+            messages: vec![],
+        }
+    }
+}
+
+struct CurrentRTCSession {
+    channel_id: ChannelID,
+}
+
+impl CurrentRTCSession {
+    fn new(channel_id: &ChannelID) -> Self {
+        Self {
+            channel_id: channel_id.clone(),
+        }
+    }
+}
+
+struct App {
     // Connection state
     connected: bool,
     server_address: String,
@@ -33,21 +65,22 @@ struct HeekChatApp {
 
     // Data
     channels: Vec<Channel>,
-    current_channel: Option<String>,
-    channel_messages: HashMap<String, Vec<Message>>,
+    current_message_channel: Option<CurrentMessageChannel>,
+    current_rtc_session: Option<CurrentRTCSession>,
 
     // Runtime
     runtime: Arc<tokio::runtime::Runtime>,
-    client: Option<ChatServiceClient>,
+    rpc: Option<ChatServiceClient>,
+    event_rx: Option<mpsc::UnboundedReceiver<Event>>,
 }
 
-impl Default for HeekChatApp {
+impl Default for App {
     fn default() -> Self {
         let firebase_auth = FirebaseAuth::new();
 
         Self {
             connected: false,
-            server_address: "127.0.0.1:8080".to_string(),
+            server_address: "ws://127.0.0.1:8080".to_string(),
             connection_error: None,
             firebase_auth,
             current_user: None,
@@ -55,23 +88,24 @@ impl Default for HeekChatApp {
             invitation_token_input: String::new(),
             server_key: String::new(),
             email_input: String::new(),
-            password_input: String::new(),
+            password_input: "qwer".to_string(), // FIXME:
             username_input: String::new(),
             message_input: String::new(),
             oauth_receiver: None,
             oauth_redirect_uri: None,
             channels: Vec::new(),
-            current_channel: None,
-            channel_messages: HashMap::new(),
+            current_message_channel: None,
+            current_rtc_session: None,
             runtime: Arc::new(
                 tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"),
             ),
-            client: None,
+            rpc: None,
+            event_rx: None,
         }
     }
 }
 
-impl HeekChatApp {
+impl App {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Default::default()
     }
@@ -150,6 +184,75 @@ impl HeekChatApp {
         }
     }
 
+    fn fetch_channels(&mut self) {
+        if let (Some(client), Some(firebase_token)) = (&self.rpc, &self.firebase_token) {
+            let runtime = self.runtime.clone();
+            let client = client.clone();
+            let firebase_token = firebase_token.clone();
+
+            match runtime.block_on(async move {
+                client
+                    .list_channels(tarpc::context::current(), firebase_token)
+                    .await
+                    .map_err(|e| format!("RPC failed: {}", e))?
+            }) {
+                Ok(channels) => {
+                    self.channels = channels;
+                    tracing::info!("Fetched {} channels", self.channels.len());
+                }
+                Err(e) => {
+                    tracing::error!("Failed to fetch channels: {}", e);
+                }
+            }
+        }
+    }
+
+    fn join_rtc_session(&mut self, channel_id: ChannelID) {
+        if let (Some(client), Some(firebase_token)) = (&self.rpc, &self.firebase_token) {
+            let runtime = self.runtime.clone();
+            let client = client.clone();
+            let channel_id = channel_id.clone();
+            let firebase_token = firebase_token.clone();
+
+            match runtime.block_on(async move {
+                client
+                    .join_rtc_session(tarpc::context::current(), firebase_token, channel_id)
+                    .await
+            }) {
+                Ok(_) => {
+                    self.current_rtc_session = Some(CurrentRTCSession::new(&channel_id));
+                    tracing::info!("Joined RTC session");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to join rtc session: {}", e);
+                }
+            }
+        }
+    }
+
+    fn leave_rtc_session(&mut self) {
+        if let (Some(client), Some(firebase_token), Some(session)) =
+            (&self.rpc, &self.firebase_token, &self.current_rtc_session)
+        {
+            let runtime = self.runtime.clone();
+            let client = client.clone();
+            let firebase_token = firebase_token.clone();
+
+            let _ = runtime.block_on(async move {
+                client
+                    .leave_rtc_session(
+                        tarpc::context::current(),
+                        firebase_token,
+                        session.channel_id.clone(),
+                    )
+                    .await
+            });
+
+            self.current_rtc_session = None;
+            tracing::info!("Left RTC session");
+        }
+    }
+
     fn connect_to_server_with_firebase_token(&mut self, firebase_token: String) {
         let addr = self.server_address.clone();
         let runtime = self.runtime.clone();
@@ -160,25 +263,13 @@ impl HeekChatApp {
 
         // Connect to server and register user
         match runtime.block_on(async move {
-            // Parse address
-            let socket_addr: std::net::SocketAddr = addr
-                .parse()
-                .map_err(|e| format!("Invalid address: {}", e))?;
-
-            // Connect to server
-            let transport = tarpc::serde_transport::tcp::connect(
-                socket_addr,
-                tokio_serde::formats::Cbor::default,
-            )
-            .await
-            .map_err(|e| format!("Connection failed: {}", e))?;
-
-            let client =
-                ChatServiceClient::new(tarpc::client::Config::default(), transport).spawn();
+            let conn = Connection::establish(&addr).await?;
+            let rpc = conn.rpc;
+            let event_rx = conn.event_rx;
 
             // Join
             if !invitation_token.is_empty() {
-                let _ = client
+                let _ = rpc
                     .join(
                         tarpc::context::current(),
                         firebase_token.clone(),
@@ -190,19 +281,25 @@ impl HeekChatApp {
                     .map_err(|e| format!("Join failed: {}", e))?;
             }
 
-            let user = client
+            let user = rpc
                 .get_me(tarpc::context::current(), firebase_token.clone())
                 .await
                 .map_err(|e| format!("RPC failed: {}", e))?
                 .map_err(|e| format!("Get me failed: {}", e))?;
 
-            Ok::<(ChatServiceClient, User), String>((client, user))
+            Ok::<(ChatServiceClient, mpsc::UnboundedReceiver<Event>, User), String>((
+                rpc, event_rx, user,
+            ))
         }) {
-            Ok((client, user)) => {
-                self.client = Some(client);
+            Ok((rpc, event_rx, user)) => {
+                self.rpc = Some(rpc);
+                self.event_rx = Some(event_rx);
                 self.current_user = Some(user);
                 self.connected = true;
                 tracing::info!("Connected to server successfully");
+
+                // Fetch channel list
+                self.fetch_channels();
             }
             Err(e) => {
                 self.connection_error = Some(e);
@@ -297,11 +394,44 @@ impl HeekChatApp {
                 ui.heading("Channels");
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for channel in &self.channels {
-                        let selected = self.current_channel.as_ref() == Some(&channel.channel_id);
-                        if ui.selectable_label(selected, &channel.name).clicked() {
-                            self.current_channel = Some(channel.channel_id.clone());
-                        }
+                    for channel in &self.channels.clone() {
+                        let selected = self.current_message_channel.as_ref().map(|c| c.channel_id)
+                            == Some(channel.channel_id);
+
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(selected, &channel.name).clicked() {
+                                self.current_message_channel =
+                                    Some(CurrentMessageChannel::new(&channel.channel_id));
+                            }
+
+                            // RTC button
+                            let in_rtc_session =
+                                self.current_rtc_session.as_ref().map(|s| s.channel_id)
+                                    == Some(channel.channel_id);
+                            let rtc_button_text = if in_rtc_session { "🔊" } else { "🔇" };
+
+                            if ui.small_button(rtc_button_text).clicked() {
+                                if in_rtc_session {
+                                    self.leave_rtc_session();
+                                } else {
+                                    self.join_rtc_session(channel.channel_id.clone());
+                                }
+                            }
+                        });
+
+                        // Show voice participants
+                        // if let Some(voice_state) =
+                        //     self.voice_channel_states.get(&channel.channel_id)
+                        // {
+                        //     if !voice_state.participants.is_empty() {
+                        //         ui.indent(channel.channel_id.clone(), |ui| {
+                        //             ui.label(format!(
+                        //                 "🎙️ {} in voice",
+                        //                 voice_state.participants.len()
+                        //             ));
+                        //         });
+                        //     }
+                        // }
                     }
                 });
 
@@ -315,21 +445,19 @@ impl HeekChatApp {
 
             // Chat area
             ui.vertical(|ui| {
-                if let Some(channel_id) = &self.current_channel {
+                if let Some(channel) = &self.current_message_channel {
                     // Messages
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
-                            if let Some(messages) = self.channel_messages.get(channel_id) {
-                                for msg in messages {
-                                    ui.horizontal(|ui| {
-                                        ui.label(&msg.sender_id);
-                                        ui.label(":");
-                                        // TODO: Decrypt message content
-                                        ui.label("<encrypted>");
-                                    });
-                                }
+                            for msg in &channel.messages {
+                                ui.horizontal(|ui| {
+                                    ui.label(&msg.sender_id.to_string());
+                                    ui.label(":");
+                                    // TODO: Decrypt message content
+                                    ui.label("<encrypted>");
+                                });
                             }
                         });
 
@@ -354,12 +482,91 @@ impl HeekChatApp {
             });
         });
     }
+
+    fn check_events(&mut self) {
+        let mut events = Vec::new();
+        if let Some(event_rx) = &mut self.event_rx {
+            while let Ok(event) = event_rx.try_recv() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            self.handle_event(event);
+        }
+    }
+
+    fn handle_event(&mut self, event: Event) {
+        use heek_chat_lib::{Event, RTCSessionEvent};
+
+        match event {
+            Event::RTCSession { channel_id, event } => {
+                tracing::info!("Received RTC event for channel {}: {:?}", channel_id, event);
+                match event {
+                    RTCSessionEvent::UserJoined { user_id } => {
+                        tracing::info!(
+                            "User {} joined RTC session in channel {}",
+                            user_id,
+                            channel_id
+                        );
+                        // TODO: Handle user joined
+                    }
+                    RTCSessionEvent::UserLeft { user_id } => {
+                        tracing::info!(
+                            "User {} left RTC session in channel {}",
+                            user_id,
+                            channel_id
+                        );
+                        // TODO: Handle user left
+                    }
+                    RTCSessionEvent::OfferReceived {
+                        from_user_id,
+                        sdp: _,
+                    } => {
+                        tracing::info!(
+                            "Received offer from {} in channel {}",
+                            from_user_id,
+                            channel_id
+                        );
+                        // TODO: Handle WebRTC offer
+                    }
+                    RTCSessionEvent::AnswerReceived {
+                        from_user_id,
+                        sdp: _,
+                    } => {
+                        tracing::info!(
+                            "Received answer from {} in channel {}",
+                            from_user_id,
+                            channel_id
+                        );
+                        // TODO: Handle WebRTC answer
+                    }
+                    RTCSessionEvent::IceCandidateReceived {
+                        from_user_id,
+                        candidate: _,
+                    } => {
+                        tracing::info!(
+                            "Received ICE candidate from {} in channel {}",
+                            from_user_id,
+                            channel_id
+                        );
+                        // TODO: Handle ICE candidate
+                    }
+                }
+            }
+            Event::Error { message } => {
+                tracing::error!("Server error: {}", message);
+            }
+        }
+    }
 }
 
-impl eframe::App for HeekChatApp {
+impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Check for OAuth callback
         self.check_oauth_callback();
+
+        // Check for server events
+        self.check_events();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.connected {
@@ -373,11 +580,21 @@ impl eframe::App for HeekChatApp {
         if self.oauth_receiver.is_some() {
             ctx.request_repaint();
         }
+
+        // Request repaint if connected to check for events
+        if self.connected {
+            ctx.request_repaint();
+        }
     }
 }
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_level(true)
+        .with_writer(std::io::stdout)
+        .init();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -389,6 +606,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Heek Chat",
         native_options,
-        Box::new(|cc| Ok(Box::new(HeekChatApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
 }

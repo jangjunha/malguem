@@ -39,7 +39,7 @@ async fn fetch_public_keys() -> Result<HashMap<String, String>, String> {
     Ok(keys)
 }
 
-pub async fn verify_firebase_token(id_token: &str) -> Result<String, String> {
+pub async fn verify_id_token(id_token: &str) -> Result<String, String> {
     let header =
         decode_header(id_token).map_err(|e| format!("Failed to decode token header: {}", e))?;
     let kid = header

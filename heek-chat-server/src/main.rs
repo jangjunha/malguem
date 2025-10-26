@@ -1,21 +1,27 @@
 use chrono::{DateTime, TimeDelta, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, future};
 use heek_chat_lib::{
-    Channel, ChannelVisibility, ChatService, EncryptionKey, Message, Pagination,
-    PaginationDirection, User, VoiceCallSession,
+    Channel, ChannelID, ChannelVisibility, ChatService, Event, Message, Pagination,
+    PaginationDirection, RTCSession, User, UserID,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tarpc::{
     context,
     server::{self, Channel as TarpcChannel},
 };
-use tokio::sync::RwLock;
-use uuid::Uuid;
+use tokio::sync::{RwLock, mpsc};
+use uuid::{Uuid, uuid};
 
+use firebase_verify::verify_id_token;
+
+use crate::connection::listen;
+
+mod connection;
 mod firebase_verify;
-use firebase_verify::verify_firebase_token as verify_id_token;
+
+type ConnectionID = Uuid;
 
 struct Invitation {
     pub inviter_id: Option<String>,
@@ -28,19 +34,29 @@ struct UserWithCredentials {
     pub firebase_uid: String,
 }
 
+type InvitationToken = String;
+
 #[derive(Clone)]
 struct ChatServer {
+    current_connection_id: Option<ConnectionID>,
+
     // In-memory storage for now (will be replaced with PostgreSQL)
-    invitations: Arc<RwLock<HashMap<String, Invitation>>>,
-    users: Arc<RwLock<HashMap<String, UserWithCredentials>>>,
-    channels: Arc<RwLock<HashMap<String, Channel>>>,
-    messages: Arc<RwLock<HashMap<String, Vec<Message>>>>,
-    voice_calls: Arc<RwLock<HashMap<String, VoiceCallSession>>>,
+    invitations: Arc<RwLock<HashMap<InvitationToken, Invitation>>>,
+    users: Arc<RwLock<HashMap<UserID, UserWithCredentials>>>,
+    channels: Arc<RwLock<HashMap<ChannelID, Channel>>>,
+    messages: Arc<RwLock<HashMap<ChannelID, Vec<Message>>>>,
+    rtc_sessions: Arc<RwLock<HashMap<ChannelID, RTCSession>>>,
+
+    user_connections: Arc<RwLock<HashMap<UserID, HashSet<ConnectionID>>>>,
+    event_senders: Arc<RwLock<HashMap<ConnectionID, mpsc::UnboundedSender<Event>>>>,
 }
 
 impl ChatServer {
     fn new() -> Self {
         Self {
+            current_connection_id: None,
+            user_connections: Arc::new(RwLock::new(HashMap::new())),
+            event_senders: Arc::new(RwLock::new(HashMap::new())),
             invitations: Arc::new(RwLock::new({
                 let mut invitations = HashMap::new();
                 invitations.insert(
@@ -53,10 +69,62 @@ impl ChatServer {
                 ); // FIXME:
                 invitations
             })),
-            users: Arc::new(RwLock::new(HashMap::new())),
-            channels: Arc::new(RwLock::new(HashMap::new())),
-            messages: Arc::new(RwLock::new(HashMap::new())),
-            voice_calls: Arc::new(RwLock::new(HashMap::new())),
+            users: Arc::new(RwLock::new({
+                let mut users = HashMap::new();
+                users.insert(
+                    uuid!("00000000-0000-0000-0000-000000000000"),
+                    UserWithCredentials {
+                        user: User {
+                            user_id: uuid!("00000000-0000-0000-0000-000000000000"),
+                            username: "peachricecake".to_string(),
+                            profile_image: None,
+                        },
+                        firebase_uid: "yx5Y3VxfAAOlSeoxoSTTXP48YSe2".to_string(),
+                    },
+                ); // FIXME:
+                users.insert(
+                    uuid!("00000000-0000-0000-0000-000000000001"),
+                    UserWithCredentials {
+                        user: User {
+                            user_id: uuid!("00000000-0000-0000-0000-000000000001"),
+                            username: "jangjunha113".to_string(),
+                            profile_image: None,
+                        },
+                        firebase_uid: "aIbDhjy2xcfMAEpHWLlvE320Mz32".to_string(),
+                    },
+                );
+                users
+            })),
+            channels: Arc::new(RwLock::new({
+                let mut channels = HashMap::new();
+                channels.insert(
+                    uuid!("00000000-0000-0000-0000-000000000000"),
+                    Channel {
+                        channel_id: uuid!("00000000-0000-0000-0000-000000000000"),
+                        name: "random".to_string(),
+                        visibility: ChannelVisibility::Public,
+                        member_ids: HashSet::from([
+                            uuid!("00000000-0000-0000-0000-000000000000"),
+                            uuid!("00000000-0000-0000-0000-000000000001"),
+                        ]),
+                    },
+                );
+                channels
+            })),
+            messages: Arc::new(RwLock::new({
+                let mut messages = HashMap::new();
+                messages.insert(
+                    uuid!("00000000-0000-0000-0000-000000000000"),
+                    vec![Message {
+                        cursor: 0,
+                        sender_id: uuid!("00000000-0000-0000-0000-000000000000"),
+                        content: vec![],
+                        timestamp: Utc::now(),
+                    }],
+                );
+                messages
+            })),
+            rtc_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -76,7 +144,21 @@ impl ChatServer {
             .values()
             .find(|u| u.firebase_uid == firebase_uid)
         {
-            Ok(user_with_credentials.user.clone())
+            let user = user_with_credentials.user.clone();
+
+            // Try to register event sender from the first available pending connection
+            // This is a simplified approach: first auth call from a connection registers that connection's event_tx
+            self.user_connections
+                .write()
+                .await
+                .entry(user.user_id.clone())
+                .or_insert_with(HashSet::new)
+                .insert(
+                    self.current_connection_id
+                        .expect("current_connection_id is not set"),
+                );
+
+            Ok(user)
         } else {
             Err("Invalid token".to_string())
         }
@@ -90,7 +172,7 @@ impl ChatService for ChatServer {
         id_token: String,
         invitation_token: String,
         username: String,
-    ) -> Result<String, String> {
+    ) -> Result<UserID, String> {
         let firebase_uid = self.authenticate_id_token_only(&id_token).await?;
         let now = Utc::now();
 
@@ -111,7 +193,7 @@ impl ChatService for ChatServer {
             return Err("Username already exists".to_string());
         }
 
-        let user_id = Uuid::new_v4().to_string();
+        let user_id = Uuid::new_v4();
         if users.contains_key(&user_id) {
             return Err("Unexpected error".to_string()); // collision
         }
@@ -140,7 +222,7 @@ impl ChatService for ChatServer {
         self,
         _: context::Context,
         id_token: String,
-        user_id: String,
+        user_id: UserID,
     ) -> Result<User, String> {
         let _ = self.authenticate(&id_token).await?;
         self.users
@@ -194,10 +276,10 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channel = Channel {
-            channel_id: Uuid::new_v4().to_string(),
+            channel_id: Uuid::new_v4(),
             name,
             visibility,
-            member_ids: vec![authenticated_user.user_id],
+            member_ids: [authenticated_user.user_id].into_iter().collect(),
         };
 
         self.channels
@@ -229,7 +311,7 @@ impl ChatService for ChatServer {
         self,
         _: context::Context,
         id_token: String,
-        channel_id: String,
+        channel_id: ChannelID,
     ) -> Result<(), String> {
         let authenticated_user = self.authenticate(&id_token).await?;
 
@@ -243,7 +325,7 @@ impl ChatService for ChatServer {
         }
 
         if !channel.member_ids.contains(&authenticated_user.user_id) {
-            channel.member_ids.push(authenticated_user.user_id);
+            channel.member_ids.insert(authenticated_user.user_id);
         }
 
         Ok(())
@@ -253,7 +335,7 @@ impl ChatService for ChatServer {
         self,
         _: context::Context,
         id_token: String,
-        channel_id: String,
+        channel_id: ChannelID,
     ) -> Result<(), String> {
         let authenticated_user = self.authenticate(&id_token).await?;
 
@@ -270,8 +352,8 @@ impl ChatService for ChatServer {
         self,
         _: context::Context,
         id_token: String,
-        invitee_id: String,
-        channel_id: String,
+        invitee_id: UserID,
+        channel_id: ChannelID,
     ) -> Result<(), String> {
         let authenticated_user = self.authenticate(&id_token).await?;
         let inviter_id = &authenticated_user.user_id;
@@ -289,7 +371,7 @@ impl ChatService for ChatServer {
         }
 
         if !channel.member_ids.contains(&invitee_id) {
-            channel.member_ids.push(invitee_id);
+            channel.member_ids.insert(invitee_id);
         }
 
         Ok(())
@@ -299,7 +381,7 @@ impl ChatService for ChatServer {
         self,
         _: context::Context,
         id_token: String,
-        channel_id: String,
+        channel_id: ChannelID,
         content: Vec<u8>,
     ) -> Result<(), String> {
         let authenticated_user = self.authenticate(&id_token).await?;
@@ -333,7 +415,7 @@ impl ChatService for ChatServer {
         self,
         _: context::Context,
         id_token: String,
-        channel_id: String,
+        channel_id: ChannelID,
         pagination: Pagination,
     ) -> Result<Vec<Message>, String> {
         let authenticated_user = self.authenticate(&id_token).await?;
@@ -363,12 +445,12 @@ impl ChatService for ChatServer {
         }
     }
 
-    async fn start_voice_call(
+    async fn join_rtc_session(
         self,
         _: context::Context,
         id_token: String,
-        channel_id: String,
-    ) -> Result<VoiceCallSession, String> {
+        channel_id: ChannelID,
+    ) -> Result<RTCSession, String> {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
@@ -377,48 +459,58 @@ impl ChatService for ChatServer {
             return Err("Not a channel member".to_string());
         }
 
-        let mut voice_calls = self.voice_calls.write().await;
+        let mut sessions = self.rtc_sessions.write().await;
 
-        if voice_calls.contains_key(&channel_id) {
-            return Err("Voice call already exists for this channel".to_string());
-        }
-
-        let session = VoiceCallSession {
-            session_id: Uuid::new_v4().to_string(),
-            channel_id: channel_id.clone(),
-            participants: vec![authenticated_user.user_id.clone()],
-            encryption_keys: vec![EncryptionKey {
-                sender_id: authenticated_user.user_id,
-                key: vec![0u8; 32], // TODO: Generate and encrypt actual key
-            }],
+        // Get or create session
+        let (session, is_new_participant) = if let Some(session) = sessions.get_mut(&channel_id) {
+            let is_new = !session.participants.contains(&authenticated_user.user_id);
+            session
+                .participants
+                .insert(authenticated_user.user_id.clone());
+            (session.clone(), is_new)
+        } else {
+            let mut session = RTCSession::new(&channel_id);
+            session
+                .participants
+                .insert(authenticated_user.user_id.clone());
+            sessions.insert(channel_id.clone(), session.clone());
+            (session.clone(), true)
         };
 
-        voice_calls.insert(channel_id, session.clone());
+        // Broadcast UserJoined event to all participants in the channel
+        if is_new_participant {
+            let event = Event::RTCSession {
+                channel_id: channel_id.clone(),
+                event: heek_chat_lib::RTCSessionEvent::UserJoined {
+                    user_id: authenticated_user.user_id.clone(),
+                },
+            };
+            let event_senders = self.event_senders.read().await;
+            let user_connections = self.user_connections.read().await;
+
+            for participant_id in &session.participants {
+                if participant_id == &authenticated_user.user_id {
+                    continue;
+                }
+                // Send event to all connections for this participant
+                if let Some(connection_ids) = user_connections.get(participant_id) {
+                    for connection_id in connection_ids {
+                        if let Some(sender) = event_senders.get(connection_id) {
+                            let _ = sender.send(event.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(session)
     }
 
-    async fn get_voice_call(
+    async fn leave_rtc_session(
         self,
         _: context::Context,
         id_token: String,
-        channel_id: String,
-    ) -> Result<Option<VoiceCallSession>, String> {
-        let authenticated_user = self.authenticate(&id_token).await?;
-
-        let channels = self.channels.read().await;
-        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
-        if !channel.member_ids.contains(&authenticated_user.user_id) {
-            return Err("Not a channel member".to_string());
-        }
-
-        Ok(self.voice_calls.read().await.get(&channel_id).cloned())
-    }
-
-    async fn end_voice_call(
-        self,
-        _: context::Context,
-        id_token: String,
-        channel_id: String,
+        channel_id: ChannelID,
     ) -> Result<(), String> {
         let authenticated_user = self.authenticate(&id_token).await?;
 
@@ -428,37 +520,243 @@ impl ChatService for ChatServer {
             return Err("Not a channel member".to_string());
         }
 
-        self.voice_calls.write().await.remove(&channel_id);
+        let mut sessions = self.rtc_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&channel_id) {
+            let other_participants = session.participants.clone();
+            session.participants.remove(&authenticated_user.user_id);
+            if session.participants.is_empty() {
+                sessions.remove(&channel_id);
+            }
+
+            // Broadcast UserJoined event to all participants in the channel
+            let event = Event::RTCSession {
+                channel_id: channel_id.clone(),
+                event: heek_chat_lib::RTCSessionEvent::UserLeft {
+                    user_id: authenticated_user.user_id.clone(),
+                },
+            };
+            let event_senders = self.event_senders.read().await;
+            let user_connections = self.user_connections.read().await;
+
+            for participant_id in other_participants {
+                // Send event to all connections for this participant
+                if let Some(connection_ids) = user_connections.get(&participant_id) {
+                    for connection_id in connection_ids {
+                        if let Some(sender) = event_senders.get(connection_id) {
+                            let _ = sender.send(event.clone());
+                        }
+                    }
+                }
+            }
+        } else {
+            return Err("Channel not found".to_string());
+        };
+
+        Ok(())
+    }
+
+    async fn offer_rtc_connection(
+        self,
+        _: context::Context,
+        id_token: String,
+        channel_id: ChannelID,
+        target_user_id: UserID,
+        sdp: String,
+    ) -> Result<(), String> {
+        let authenticated_user = self.authenticate(&id_token).await?;
+
+        let channels = self.channels.read().await;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if !channel.member_ids.contains(&authenticated_user.user_id) {
+            return Err("Not a channel member".to_string());
+        }
+        if !channel.member_ids.contains(&target_user_id) {
+            return Err("Not a RTC session member".to_string());
+        }
+
+        let event = Event::RTCSession {
+            channel_id: channel_id.clone(),
+            event: heek_chat_lib::RTCSessionEvent::OfferReceived {
+                from_user_id: authenticated_user.user_id.clone(),
+                sdp,
+            },
+        };
+        for target_user_conn_id in self
+            .user_connections
+            .read()
+            .await
+            .get(&target_user_id)
+            .iter()
+            .flat_map(|s| s.iter())
+        {
+            if let Some(sender) = self.event_senders.read().await.get(target_user_conn_id) {
+                let _ = sender.send(event.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn answer_rtc_connection(
+        self,
+        _: context::Context,
+        id_token: String,
+        channel_id: ChannelID,
+        target_user_id: UserID,
+        sdp: String,
+    ) -> Result<(), String> {
+        let authenticated_user = self.authenticate(&id_token).await?;
+
+        let channels = self.channels.read().await;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if !channel.member_ids.contains(&authenticated_user.user_id) {
+            return Err("Not a channel member".to_string());
+        }
+        if !channel.member_ids.contains(&target_user_id) {
+            return Err("Not a RTC session member".to_string());
+        }
+
+        let event = Event::RTCSession {
+            channel_id: channel_id.clone(),
+            event: heek_chat_lib::RTCSessionEvent::AnswerReceived {
+                from_user_id: authenticated_user.user_id.clone(),
+                sdp,
+            },
+        };
+        for target_user_conn_id in self
+            .user_connections
+            .read()
+            .await
+            .get(&target_user_id)
+            .iter()
+            .flat_map(|s| s.iter())
+        {
+            if let Some(sender) = self.event_senders.read().await.get(target_user_conn_id) {
+                let _ = sender.send(event.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn ice_candidate_rtc_connection(
+        self,
+        _: context::Context,
+        id_token: String,
+        channel_id: ChannelID,
+        target_user_id: UserID,
+        candidate: String,
+    ) -> Result<(), String> {
+        let authenticated_user = self.authenticate(&id_token).await?;
+
+        let channels = self.channels.read().await;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if !channel.member_ids.contains(&authenticated_user.user_id) {
+            return Err("Not a channel member".to_string());
+        }
+        if !channel.member_ids.contains(&target_user_id) {
+            return Err("Not a RTC session member".to_string());
+        }
+
+        let event = Event::RTCSession {
+            channel_id: channel_id.clone(),
+            event: heek_chat_lib::RTCSessionEvent::IceCandidateReceived {
+                from_user_id: authenticated_user.user_id.clone(),
+                candidate,
+            },
+        };
+        for target_user_conn_id in self
+            .user_connections
+            .read()
+            .await
+            .get(&target_user_id)
+            .iter()
+            .flat_map(|s| s.iter())
+        {
+            if let Some(sender) = self.event_senders.read().await.get(target_user_conn_id) {
+                let _ = sender.send(event.clone());
+            }
+        }
+
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_level(true)
+        .with_writer(std::io::stdout)
+        .init();
 
     let addr: SocketAddr = "0.0.0.0:8080".parse()?;
+    let incoming = listen(addr).await?;
+    tracing::info!("Listening on: {}", addr);
 
     let server = ChatServer::new();
 
-    tracing::info!("Starting heek-chat-server on {}", addr);
+    incoming
+        .filter_map(|r: Result<_, std::io::Error>| future::ready(r.ok()))
+        .map(|conn: crate::connection::Connection| {
+            let connection_id = Uuid::new_v4();
+            let event_senders = server.event_senders.clone();
+            let user_connections = server.user_connections.clone();
 
-    let mut listener =
-        tarpc::serde_transport::tcp::listen(&addr, tokio_serde::formats::Cbor::default).await?;
+            // Spawn task to register event sender
+            let event_senders_for_register = event_senders.clone();
+            tokio::spawn(async move {
+                event_senders_for_register
+                    .write()
+                    .await
+                    .insert(connection_id.clone(), conn.event_tx);
+            });
 
-    tracing::info!("Listening for connections");
+            // Spawn task to handle cleanup on disconnect
+            let disconnect_rx = conn.disconnect_rx;
+            tokio::spawn(async move {
+                // Wait for disconnect signal
+                let _ = disconnect_rx.await;
 
-    while let Some(Ok(transport)) = listener.next().await {
-        let server = server.clone();
-        tokio::spawn(async move {
-            let channel = server::BaseChannel::with_defaults(transport);
-            let handler = channel.execute(server.serve());
-            tokio::pin!(handler);
-            while let Some(fut) = handler.next().await {
-                fut.await;
-            }
-        });
-    }
+                tracing::info!("Connection {} disconnected, cleaning up", connection_id);
+
+                event_senders.write().await.remove(&connection_id);
+                user_connections
+                    .write()
+                    .await
+                    .iter_mut()
+                    .for_each(|(_, conns)| {
+                        conns.remove(&connection_id);
+                    });
+            });
+
+            (connection_id, conn.rpc)
+        })
+        .map(|(connection_id, transport)| {
+            (connection_id, server::BaseChannel::with_defaults(transport))
+        })
+        // TODO: Add rate limiting per IP
+        // .max_channels_per_key(1, |t| { ... })
+        .map(|(connection_id, channel)| {
+            let server = {
+                let mut server = server.clone();
+                server.current_connection_id = Some(connection_id.clone());
+                server
+            };
+            tokio::spawn(
+                channel
+                    .execute(server.serve())
+                    // Handle all requests concurrently.
+                    .for_each(|response| async move {
+                        tokio::spawn(response);
+                    }),
+            )
+        })
+        // Max 32 channels.
+        .buffer_unordered(32)
+        .for_each(|_| async {})
+        .await;
 
     Ok(())
 }
