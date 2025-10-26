@@ -7,6 +7,7 @@ mod firebase_auth;
 use firebase_auth::FirebaseAuth;
 
 use crate::connection::Connection;
+use crate::rtc::RTCSessionManager;
 
 mod connection;
 mod rtc;
@@ -27,12 +28,14 @@ impl CurrentMessageChannel {
 
 struct CurrentRTCSession {
     channel_id: ChannelID,
+    manager: Arc<RTCSessionManager>,
 }
 
 impl CurrentRTCSession {
-    fn new(channel_id: &ChannelID) -> Self {
+    fn new(channel_id: &ChannelID, manager: Arc<RTCSessionManager>) -> Self {
         Self {
             channel_id: channel_id.clone(),
+            manager,
         }
     }
 }
@@ -208,20 +211,56 @@ impl App {
     }
 
     fn join_rtc_session(&mut self, channel_id: ChannelID) {
-        if let (Some(client), Some(firebase_token)) = (&self.rpc, &self.firebase_token) {
+        if let (Some(client), Some(firebase_token), Some(current_user)) =
+            (&self.rpc, &self.firebase_token, &self.current_user)
+        {
             let runtime = self.runtime.clone();
             let client = client.clone();
-            let channel_id = channel_id.clone();
+            let client_for_manager = client.clone();
+            let channel_id_clone = channel_id.clone();
             let firebase_token = firebase_token.clone();
+            let firebase_token_for_manager = firebase_token.clone();
+            let current_user_id = current_user.user_id.clone();
 
             match runtime.block_on(async move {
                 client
-                    .join_rtc_session(tarpc::context::current(), firebase_token, channel_id)
+                    .join_rtc_session(tarpc::context::current(), firebase_token, channel_id_clone)
                     .await
             }) {
-                Ok(_) => {
-                    self.current_rtc_session = Some(CurrentRTCSession::new(&channel_id));
-                    tracing::info!("Joined RTC session");
+                Ok(Ok(rtc_session)) => {
+                    // Create RTCSessionManager
+                    let manager = Arc::new(RTCSessionManager::new(
+                        channel_id.clone(),
+                        current_user_id,
+                        client_for_manager,
+                        firebase_token_for_manager,
+                        self.runtime.clone(),
+                    ));
+
+                    // Start ICE candidate sender task
+                    manager.start_ice_candidate_sender();
+
+                    // Handle existing participants (users who were already in the session)
+                    for participant_id in &rtc_session.participants {
+                        let manager_clone = Arc::clone(&manager);
+                        let participant_id = participant_id.clone();
+                        let runtime_clone = self.runtime.clone();
+
+                        runtime_clone.spawn(async move {
+                            if let Err(e) = manager_clone.handle_user_joined(participant_id).await {
+                                tracing::error!("Failed to handle existing participant: {}", e);
+                            }
+                        });
+                    }
+
+                    self.current_rtc_session = Some(CurrentRTCSession::new(&channel_id, manager));
+                    tracing::info!(
+                        "Joined RTC session with {} participants",
+                        rtc_session.participants.len()
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to join rtc session: {}", e);
                 }
                 Err(e) => {
                     tracing::error!("Failed to join rtc session: {}", e);
@@ -237,14 +276,18 @@ impl App {
             let runtime = self.runtime.clone();
             let client = client.clone();
             let firebase_token = firebase_token.clone();
+            let manager = Arc::clone(&session.manager);
+            let channel_id = session.channel_id.clone();
 
             let _ = runtime.block_on(async move {
+                // Close all WebRTC connections
+                if let Err(e) = manager.close_all().await {
+                    tracing::error!("Failed to close WebRTC connections: {}", e);
+                }
+
+                // Notify server
                 client
-                    .leave_rtc_session(
-                        tarpc::context::current(),
-                        firebase_token,
-                        session.channel_id.clone(),
-                    )
+                    .leave_rtc_session(tarpc::context::current(), firebase_token, channel_id)
                     .await
             });
 
@@ -501,56 +544,103 @@ impl App {
         match event {
             Event::RTCSession { channel_id, event } => {
                 tracing::info!("Received RTC event for channel {}: {:?}", channel_id, event);
-                match event {
-                    RTCSessionEvent::UserJoined { user_id } => {
-                        tracing::info!(
-                            "User {} joined RTC session in channel {}",
-                            user_id,
-                            channel_id
-                        );
-                        // TODO: Handle user joined
+
+                // Get the RTC session manager for this channel
+                let manager = if let Some(session) = &self.current_rtc_session {
+                    if session.channel_id == channel_id {
+                        Some(Arc::clone(&session.manager))
+                    } else {
+                        None
                     }
-                    RTCSessionEvent::UserLeft { user_id } => {
-                        tracing::info!(
-                            "User {} left RTC session in channel {}",
-                            user_id,
-                            channel_id
-                        );
-                        // TODO: Handle user left
-                    }
-                    RTCSessionEvent::OfferReceived {
-                        from_user_id,
-                        sdp: _,
-                    } => {
-                        tracing::info!(
-                            "Received offer from {} in channel {}",
+                } else {
+                    None
+                };
+
+                if let Some(manager) = manager {
+                    let runtime = self.runtime.clone();
+
+                    match event {
+                        RTCSessionEvent::UserJoined { user_id } => {
+                            tracing::info!(
+                                "User {} joined RTC session in channel {}",
+                                user_id,
+                                channel_id
+                            );
+
+                            runtime.spawn(async move {
+                                if let Err(e) = manager.handle_user_joined(user_id).await {
+                                    tracing::error!("Failed to handle user joined: {}", e);
+                                }
+                            });
+                        }
+                        RTCSessionEvent::UserLeft { user_id } => {
+                            tracing::info!(
+                                "User {} left RTC session in channel {}",
+                                user_id,
+                                channel_id
+                            );
+
+                            runtime.spawn(async move {
+                                if let Err(e) = manager.handle_user_left(user_id).await {
+                                    tracing::error!("Failed to handle user left: {}", e);
+                                }
+                            });
+                        }
+                        RTCSessionEvent::OfferReceived { from_user_id, sdp } => {
+                            tracing::info!(
+                                "Received offer from {} in channel {}",
+                                from_user_id,
+                                channel_id
+                            );
+
+                            runtime.spawn(async move {
+                                if let Err(e) =
+                                    manager.handle_offer_received(from_user_id, sdp).await
+                                {
+                                    tracing::error!("Failed to handle offer: {}", e);
+                                }
+                            });
+                        }
+                        RTCSessionEvent::AnswerReceived { from_user_id, sdp } => {
+                            tracing::info!(
+                                "Received answer from {} in channel {}",
+                                from_user_id,
+                                channel_id
+                            );
+
+                            runtime.spawn(async move {
+                                if let Err(e) =
+                                    manager.handle_answer_received(from_user_id, sdp).await
+                                {
+                                    tracing::error!("Failed to handle answer: {}", e);
+                                }
+                            });
+                        }
+                        RTCSessionEvent::IceCandidateReceived {
                             from_user_id,
-                            channel_id
-                        );
-                        // TODO: Handle WebRTC offer
+                            candidate,
+                        } => {
+                            tracing::debug!(
+                                "Received ICE candidate from {} in channel {}",
+                                from_user_id,
+                                channel_id
+                            );
+
+                            runtime.spawn(async move {
+                                if let Err(e) = manager
+                                    .handle_ice_candidate_received(from_user_id, candidate)
+                                    .await
+                                {
+                                    tracing::error!("Failed to handle ICE candidate: {}", e);
+                                }
+                            });
+                        }
                     }
-                    RTCSessionEvent::AnswerReceived {
-                        from_user_id,
-                        sdp: _,
-                    } => {
-                        tracing::info!(
-                            "Received answer from {} in channel {}",
-                            from_user_id,
-                            channel_id
-                        );
-                        // TODO: Handle WebRTC answer
-                    }
-                    RTCSessionEvent::IceCandidateReceived {
-                        from_user_id,
-                        candidate: _,
-                    } => {
-                        tracing::info!(
-                            "Received ICE candidate from {} in channel {}",
-                            from_user_id,
-                            channel_id
-                        );
-                        // TODO: Handle ICE candidate
-                    }
+                } else {
+                    tracing::warn!(
+                        "Received RTC event for channel {} but no active session",
+                        channel_id
+                    );
                 }
             }
             Event::Error { message } => {
