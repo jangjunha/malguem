@@ -1,4 +1,6 @@
-fn main() {
+use std::io;
+
+fn main() -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         let mut res = winres::WindowsResource::new();
@@ -11,4 +13,5 @@ fn main() {
             .set("InternalName", "malguem-desktop");
         res.compile()?;
     }
+    Ok(())
 }
