@@ -1,8 +1,8 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{StreamExt, future};
 use malguem_lib::{
-    Channel, ChannelID, ChatService, Event, Message, Pagination, PaginationDirection, RTCSession,
-    User, UserID,
+    Channel, ChannelID, ChannelType, ChatService, Event, Message, Pagination, PaginationDirection,
+    RTCSession, User, UserID,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -114,6 +114,15 @@ impl ChatServer {
                     Channel {
                         channel_id: uuid!("00000000-0000-0000-0000-000000000000"),
                         name: "random".to_string(),
+                        r#type: ChannelType::Text,
+                    },
+                );
+                channels.insert(
+                    uuid!("00000000-0000-0000-0000-000000000001"),
+                    Channel {
+                        channel_id: uuid!("00000000-0000-0000-0000-000000000001"),
+                        name: "voice".to_string(),
+                        r#type: ChannelType::RTC,
                     },
                 );
                 channels
@@ -278,12 +287,14 @@ impl ChatService for ChatServer {
         _: context::Context,
         id_token: String,
         name: String,
+        r#type: ChannelType,
     ) -> Result<Channel, String> {
         let _ = self.authenticate(&id_token).await?;
 
         let channel = Channel {
             channel_id: Uuid::new_v4(),
             name,
+            r#type,
         };
 
         self.channels
@@ -315,7 +326,10 @@ impl ChatService for ChatServer {
         let now = Utc::now();
 
         let channels = self.channels.read().await;
-        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if channel.r#type != ChannelType::Text {
+            return Err("Cannot send message to non-text channel".to_string());
+        }
 
         let mut all_messages = self.messages.write().await;
         let next_cursor = all_messages
@@ -345,7 +359,10 @@ impl ChatService for ChatServer {
         let _ = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if channel.r#type != ChannelType::Text {
+            return Err("Cannot get messages from non-text channel".to_string());
+        }
 
         let all_messages = self.messages.read().await;
         if let Some(messages) = all_messages.get(&channel_id) {
@@ -375,7 +392,10 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if channel.r#type != ChannelType::RTC {
+            return Err("Operation not allowed on non-rtc channel".to_string());
+        }
 
         let mut sessions = self.rtc_sessions.write().await;
 
@@ -433,7 +453,10 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if channel.r#type != ChannelType::RTC {
+            return Err("Operation not allowed on non-rtc channel".to_string());
+        }
 
         let mut sessions = self.rtc_sessions.write().await;
         if let Some(session) = sessions.get_mut(&channel_id) {
@@ -481,7 +504,10 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if channel.r#type != ChannelType::RTC {
+            return Err("Operation not allowed on non-rtc channel".to_string());
+        }
 
         let event = Event::RTCSession {
             channel_id: channel_id.clone(),
@@ -517,7 +543,10 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if channel.r#type != ChannelType::RTC {
+            return Err("Operation not allowed on non-rtc channel".to_string());
+        }
 
         let event = Event::RTCSession {
             channel_id: channel_id.clone(),
@@ -553,7 +582,10 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if channel.r#type != ChannelType::RTC {
+            return Err("Operation not allowed on non-rtc channel".to_string());
+        }
 
         let event = Event::RTCSession {
             channel_id: channel_id.clone(),

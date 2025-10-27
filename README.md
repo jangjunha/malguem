@@ -15,17 +15,19 @@ Malguem is a Rust-based P2P voice/video chat application with centralized text m
 
 #### Channels
 
-* Text Messages
-  * Text messages are stored in server
-* RTC Sessions (= Discord voice call)
-  * Any user can start the RTC session
-  * There can be only one RTC session for a channel
-  * A user can only participate in one RTC session at a time.
-  * RTC session member can broadcast their screen too
-* Broadcast
-  * (Nice-to) User can select the broadcasting target - fullscreen or selected window
-  * Streaming user can select the video quality (resolution and (nice-to) bitrate)
-  * Do not support multiple options for video quality
+* Channel types
+  * Text
+    * Text messages are stored in server
+  * RTC (Voice)
+    * There can be only one RTC session for a channel
+    * RTC Sessions
+      * Any user can start the RTC session
+      * A user can only participate in one RTC session at a time.
+      * RTC session member can broadcast their screen too
+    * Broadcast
+      * (Nice-to) User can select the broadcasting target - fullscreen or selected window
+      * Streaming user can select the video quality (resolution and (nice-to) bitrate)
+      * Do not support multiple options for video quality
 
 ### Technical Decisions
 

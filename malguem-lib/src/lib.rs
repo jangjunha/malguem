@@ -39,10 +39,18 @@ pub struct User {
     pub profile_image: Option<Vec<u8>>, // Under 5MiB
 }
 
+// Channel types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelType {
+    Text,
+    RTC,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
     pub channel_id: ChannelID,
     pub name: String,
+    pub r#type: ChannelType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,7 +134,11 @@ pub trait ChatService {
     ) -> Result<(), String>;
 
     // Channel operations
-    async fn create_channel(id_token: String, name: String) -> Result<Channel, String>;
+    async fn create_channel(
+        id_token: String,
+        name: String,
+        r#type: ChannelType,
+    ) -> Result<Channel, String>;
     async fn list_channels(id_token: String) -> Result<Vec<Channel>, String>;
 
     // Message operations

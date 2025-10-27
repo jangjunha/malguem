@@ -1,5 +1,5 @@
 use eframe::egui;
-use malguem_lib::{Channel, ChannelID, ChatServiceClient, Event, Message, User};
+use malguem_lib::{Channel, ChannelID, ChannelType, ChatServiceClient, Event, Message, User};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -455,70 +455,90 @@ impl App {
 
         ui.separator();
 
-        // Main content area
+        // Main content area - use available height
+        let available_height = ui.available_height();
+
         ui.horizontal(|ui| {
             // Channel list sidebar
             ui.vertical(|ui| {
                 ui.set_width(200.0);
-                ui.heading("Channels");
+                ui.set_height(available_height);
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for channel in &self.channels.clone() {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                    // Collect channels to avoid borrow checker issues
+                    let text_channels: Vec<_> = self.channels.iter()
+                        .filter(|c| matches!(c.r#type, ChannelType::Text))
+                        .cloned()
+                        .collect();
+                    let rtc_channels: Vec<_> = self.channels.iter()
+                        .filter(|c| matches!(c.r#type, ChannelType::RTC))
+                        .cloned()
+                        .collect();
+
+                    // Text Channels Section
+                    ui.heading("Text Channels");
+                    ui.separator();
+
+                    for channel in text_channels {
                         let selected = self.current_message_channel.as_ref().map(|c| c.channel_id)
                             == Some(channel.channel_id);
 
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(selected, &channel.name).clicked() {
-                                self.current_message_channel =
-                                    Some(CurrentMessageChannel::new(&channel.channel_id));
+                        if ui.selectable_label(selected, format!("# {}", &channel.name)).clicked() {
+                            self.current_message_channel =
+                                Some(CurrentMessageChannel::new(&channel.channel_id));
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    if ui.button("+ Text Channel").clicked() {
+                        // TODO: Show create text channel dialog
+                    }
+
+                    ui.add_space(20.0);
+
+                    // RTC Channels Section
+                    ui.heading("Voice Channels");
+                    ui.separator();
+
+                    for channel in rtc_channels {
+                        let in_rtc_session =
+                            self.current_rtc_session.as_ref().map(|s| s.channel_id)
+                                == Some(channel.channel_id);
+
+                        let rtc_button_text = if in_rtc_session { "🔊" } else { "🔇" };
+                        let channel_label = format!("{} {}", rtc_button_text, &channel.name);
+
+                        if ui.button(channel_label).clicked() {
+                            if in_rtc_session {
+                                self.leave_rtc_session();
+                            } else {
+                                self.join_rtc_session(channel.channel_id.clone());
                             }
+                        }
+                    }
 
-                            // RTC button
-                            let in_rtc_session =
-                                self.current_rtc_session.as_ref().map(|s| s.channel_id)
-                                    == Some(channel.channel_id);
-                            let rtc_button_text = if in_rtc_session { "🔊" } else { "🔇" };
-
-                            if ui.small_button(rtc_button_text).clicked() {
-                                if in_rtc_session {
-                                    self.leave_rtc_session();
-                                } else {
-                                    self.join_rtc_session(channel.channel_id.clone());
-                                }
-                            }
-                        });
-
-                        // Show voice participants
-                        // if let Some(voice_state) =
-                        //     self.voice_channel_states.get(&channel.channel_id)
-                        // {
-                        //     if !voice_state.participants.is_empty() {
-                        //         ui.indent(channel.channel_id.clone(), |ui| {
-                        //             ui.label(format!(
-                        //                 "🎙️ {} in voice",
-                        //                 voice_state.participants.len()
-                        //             ));
-                        //         });
-                        //     }
-                        // }
+                    ui.add_space(10.0);
+                    if ui.button("+ Voice Channel").clicked() {
+                        // TODO: Show create voice channel dialog
                     }
                 });
-
-                ui.add_space(10.0);
-                if ui.button("Create Channel").clicked() {
-                    // TODO: Show create channel dialog
-                }
             });
 
             ui.separator();
 
             // Chat area
             ui.vertical(|ui| {
+                ui.set_height(available_height);
+
                 if let Some(channel) = &self.current_message_channel {
                     // Messages
+                    let message_area_height = available_height - 50.0; // Reserve space for input
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
+                        .max_height(message_area_height)
                         .show(ui, |ui| {
                             for msg in &channel.messages {
                                 ui.horizontal(|ui| {
