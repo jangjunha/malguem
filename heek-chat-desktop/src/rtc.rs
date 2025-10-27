@@ -22,6 +22,7 @@ pub struct PeerConnection {
     user_id: UserID,
     channel_id: ChannelID,
     pending_ice_candidates: Arc<Mutex<Vec<String>>>,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl PeerConnection {
@@ -30,6 +31,7 @@ impl PeerConnection {
         user_id: UserID,
         channel_id: ChannelID,
         ice_candidate_tx: mpsc::UnboundedSender<(UserID, RTCIceCandidate)>,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create a MediaEngine
         let mut media_engine = MediaEngine::default();
@@ -80,11 +82,40 @@ impl PeerConnection {
                 Box::pin(async {})
             }));
 
+        // Set up track handler for receiving remote audio
+        let runtime_for_track = Arc::clone(&runtime);
+        peer_conn.on_track(Box::new(move |track, _, _| {
+            tracing::info!("Received remote track: {} ({})", track.id(), track.kind());
+
+            if track.kind() == webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio {
+                // Start audio playback for this track
+                let track_clone = Arc::clone(&track);
+                let runtime_clone = Arc::clone(&runtime_for_track);
+                std::thread::spawn(move || {
+                    use crate::audio_playback::AudioPlayback;
+                    match AudioPlayback::start(track_clone, runtime_clone) {
+                        Ok(playback) => {
+                            tracing::info!("Audio playback started");
+                            // Keep playback alive by keeping it in scope
+                            std::thread::park();
+                            drop(playback);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to start audio playback: {}", e);
+                        }
+                    }
+                });
+            }
+
+            Box::pin(async {})
+        }));
+
         Ok(Self {
             peer_conn,
             user_id,
             channel_id,
             pending_ice_candidates: Arc::new(Mutex::new(Vec::new())),
+            runtime,
         })
     }
 
@@ -229,6 +260,7 @@ pub struct RTCSessionManager {
     ice_candidate_tx: mpsc::UnboundedSender<(UserID, RTCIceCandidate)>,
     ice_candidate_rx: Arc<Mutex<mpsc::UnboundedReceiver<(UserID, RTCIceCandidate)>>>,
     runtime: Arc<tokio::runtime::Runtime>,
+    local_audio_track: Option<Arc<TrackLocalStaticRTP>>,
 }
 
 impl RTCSessionManager {
@@ -239,6 +271,7 @@ impl RTCSessionManager {
         rpc_client: ChatServiceClient,
         firebase_token: String,
         runtime: Arc<tokio::runtime::Runtime>,
+        local_audio_track: Option<Arc<TrackLocalStaticRTP>>,
     ) -> Self {
         let (ice_candidate_tx, ice_candidate_rx) = mpsc::unbounded_channel();
 
@@ -251,6 +284,7 @@ impl RTCSessionManager {
             ice_candidate_tx,
             ice_candidate_rx: Arc::new(Mutex::new(ice_candidate_rx)),
             runtime,
+            local_audio_track,
         }
     }
 
@@ -320,15 +354,26 @@ impl RTCSessionManager {
 
         // Create a new peer connection
         let peer = Arc::new(
-            PeerConnection::new(user_id.clone(), self.channel_id.clone(), self.ice_candidate_tx.clone())
-                .await?,
+            PeerConnection::new(
+                user_id.clone(),
+                self.channel_id.clone(),
+                self.ice_candidate_tx.clone(),
+                Arc::clone(&self.runtime),
+            )
+            .await?,
         );
 
         // Store the peer connection
         self.peers.lock().await.insert(user_id.clone(), peer.clone());
 
-        // Add audio transceiver before creating offer (ensures m-line in SDP)
-        peer.add_audio_transceiver().await?;
+        // Add local audio track if available
+        if let Some(track) = &self.local_audio_track {
+            tracing::info!("Adding local audio track to peer connection");
+            peer.add_audio_track(Arc::clone(track)).await?;
+        } else {
+            // Add audio transceiver to ensure m-line in SDP (recvonly if no local track)
+            peer.add_audio_transceiver().await?;
+        }
 
         // Create and send offer
         let offer = peer.create_offer().await?;
@@ -385,6 +430,7 @@ impl RTCSessionManager {
                         from_user_id.clone(),
                         self.channel_id.clone(),
                         self.ice_candidate_tx.clone(),
+                        Arc::clone(&self.runtime),
                     )
                     .await?,
                 );
@@ -393,11 +439,14 @@ impl RTCSessionManager {
             }
         };
 
-        // Set the remote offer first
-        peer.set_remote_offer(sdp).await?;
+        // Add local audio track if available (before setting remote description)
+        if let Some(track) = &self.local_audio_track {
+            tracing::info!("Adding local audio track to peer connection");
+            peer.add_audio_track(Arc::clone(track)).await?;
+        }
 
-        // Note: No need to add transceiver when receiving offer, the remote offer
-        // already includes media lines that will be negotiated
+        // Set the remote offer
+        peer.set_remote_offer(sdp).await?;
 
         // Create and send answer
         let answer = peer.create_answer().await?;

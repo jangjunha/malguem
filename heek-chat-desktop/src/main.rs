@@ -6,9 +6,12 @@ use tokio::sync::mpsc;
 mod firebase_auth;
 use firebase_auth::FirebaseAuth;
 
+use crate::audio_capture::AudioCapture;
 use crate::connection::Connection;
 use crate::rtc::RTCSessionManager;
 
+mod audio_capture;
+mod audio_playback;
 mod connection;
 mod rtc;
 
@@ -29,13 +32,20 @@ impl CurrentMessageChannel {
 struct CurrentRTCSession {
     channel_id: ChannelID,
     manager: Arc<RTCSessionManager>,
+    #[allow(dead_code)]
+    audio_capture: Option<AudioCapture>,
 }
 
 impl CurrentRTCSession {
-    fn new(channel_id: &ChannelID, manager: Arc<RTCSessionManager>) -> Self {
+    fn new(
+        channel_id: &ChannelID,
+        manager: Arc<RTCSessionManager>,
+        audio_capture: Option<AudioCapture>,
+    ) -> Self {
         Self {
             channel_id: channel_id.clone(),
             manager,
+            audio_capture,
         }
     }
 }
@@ -228,13 +238,28 @@ impl App {
                     .await
             }) {
                 Ok(Ok(rtc_session)) => {
-                    // Create RTCSessionManager
+                    // Start audio capture
+                    let (audio_capture, audio_track) =
+                        match AudioCapture::start(self.runtime.clone()) {
+                            Ok(capture) => {
+                                let track = capture.track();
+                                tracing::info!("Audio capture started successfully");
+                                (Some(capture), Some(track))
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to start audio capture: {}", e);
+                                (None, None)
+                            }
+                        };
+
+                    // Create RTCSessionManager with audio track
                     let manager = Arc::new(RTCSessionManager::new(
                         channel_id.clone(),
                         current_user_id,
                         client_for_manager,
                         firebase_token_for_manager,
                         self.runtime.clone(),
+                        audio_track,
                     ));
 
                     // Start ICE candidate sender task
@@ -253,7 +278,8 @@ impl App {
                         });
                     }
 
-                    self.current_rtc_session = Some(CurrentRTCSession::new(&channel_id, manager));
+                    self.current_rtc_session =
+                        Some(CurrentRTCSession::new(&channel_id, manager, audio_capture));
                     tracing::info!(
                         "Joined RTC session with {} participants",
                         rtc_session.participants.len()
