@@ -3,6 +3,9 @@ name = "malguem-desktop"
 version = "0.1.0"
 edition = "2024"
 
+[build-dependencies]
+winres = "0.1"
+
 [dependencies]
 aegis = "0.9.3"
 eframe = { version = "0.33.0", default-features = true }
