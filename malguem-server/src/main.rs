@@ -1,8 +1,8 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{StreamExt, future};
 use malguem_lib::{
-    Channel, ChannelID, ChannelVisibility, ChatService, Event, Message, Pagination,
-    PaginationDirection, RTCSession, User, UserID,
+    Channel, ChannelID, ChatService, Event, Message, Pagination, PaginationDirection, RTCSession,
+    User, UserID,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -114,12 +114,6 @@ impl ChatServer {
                     Channel {
                         channel_id: uuid!("00000000-0000-0000-0000-000000000000"),
                         name: "random".to_string(),
-                        visibility: ChannelVisibility::Public,
-                        member_ids: HashSet::from([
-                            uuid!("00000000-0000-0000-0000-000000000000"),
-                            uuid!("00000000-0000-0000-0000-000000000001"),
-                            uuid!("00000000-0000-0000-0000-000000000002"),
-                        ]),
                     },
                 );
                 channels
@@ -284,15 +278,12 @@ impl ChatService for ChatServer {
         _: context::Context,
         id_token: String,
         name: String,
-        visibility: ChannelVisibility,
     ) -> Result<Channel, String> {
-        let authenticated_user = self.authenticate(&id_token).await?;
+        let _ = self.authenticate(&id_token).await?;
 
         let channel = Channel {
             channel_id: Uuid::new_v4(),
             name,
-            visibility,
-            member_ids: [authenticated_user.user_id].into_iter().collect(),
         };
 
         self.channels
@@ -307,87 +298,10 @@ impl ChatService for ChatServer {
         _: context::Context,
         id_token: String,
     ) -> Result<Vec<Channel>, String> {
-        let authenticated_user = self.authenticate(&id_token).await?;
+        let _ = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        Ok(channels
-            .values()
-            .filter(|c| {
-                c.member_ids.contains(&authenticated_user.user_id)
-                    || c.visibility == ChannelVisibility::Public
-            })
-            .cloned()
-            .collect())
-    }
-
-    async fn join_channel(
-        self,
-        _: context::Context,
-        id_token: String,
-        channel_id: ChannelID,
-    ) -> Result<(), String> {
-        let authenticated_user = self.authenticate(&id_token).await?;
-
-        let mut channels = self.channels.write().await;
-        let channel = channels.get_mut(&channel_id).ok_or("Channel not found")?;
-
-        if channel.visibility == ChannelVisibility::Private
-            && !channel.member_ids.contains(&authenticated_user.user_id)
-        {
-            return Err("Cannot join private channel without invitation".to_string());
-        }
-
-        if !channel.member_ids.contains(&authenticated_user.user_id) {
-            channel.member_ids.insert(authenticated_user.user_id);
-        }
-
-        Ok(())
-    }
-
-    async fn leave_channel(
-        self,
-        _: context::Context,
-        id_token: String,
-        channel_id: ChannelID,
-    ) -> Result<(), String> {
-        let authenticated_user = self.authenticate(&id_token).await?;
-
-        let mut channels = self.channels.write().await;
-        let channel = channels.get_mut(&channel_id).ok_or("Channel not found")?;
-
-        channel
-            .member_ids
-            .retain(|id| id != &authenticated_user.user_id);
-        Ok(())
-    }
-
-    async fn invite_to_channel(
-        self,
-        _: context::Context,
-        id_token: String,
-        invitee_id: UserID,
-        channel_id: ChannelID,
-    ) -> Result<(), String> {
-        let authenticated_user = self.authenticate(&id_token).await?;
-        let inviter_id = &authenticated_user.user_id;
-
-        let mut channels = self.channels.write().await;
-        let channel = channels.get_mut(&channel_id).ok_or("Channel not found")?;
-        if !channel.member_ids.contains(inviter_id) {
-            return Err("Inviter is not a channel member".to_string());
-        }
-
-        if channel.visibility == ChannelVisibility::Private
-            && !channel.member_ids.contains(inviter_id)
-        {
-            return Err("Only members can invite to private channels".to_string());
-        }
-
-        if !channel.member_ids.contains(&invitee_id) {
-            channel.member_ids.insert(invitee_id);
-        }
-
-        Ok(())
+        Ok(channels.values().cloned().collect())
     }
 
     async fn send_message(
@@ -401,10 +315,7 @@ impl ChatService for ChatServer {
         let now = Utc::now();
 
         let channels = self.channels.read().await;
-        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
-        if !channel.member_ids.contains(&authenticated_user.user_id) {
-            return Err("Not a channel member".to_string());
-        }
+        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
 
         let mut all_messages = self.messages.write().await;
         let next_cursor = all_messages
@@ -431,13 +342,10 @@ impl ChatService for ChatServer {
         channel_id: ChannelID,
         pagination: Pagination,
     ) -> Result<Vec<Message>, String> {
-        let authenticated_user = self.authenticate(&id_token).await?;
+        let _ = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
-        if !channel.member_ids.contains(&authenticated_user.user_id) {
-            return Err("Not a channel member".to_string());
-        }
+        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
 
         let all_messages = self.messages.read().await;
         if let Some(messages) = all_messages.get(&channel_id) {
@@ -467,10 +375,7 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
-        if !channel.member_ids.contains(&authenticated_user.user_id) {
-            return Err("Not a channel member".to_string());
-        }
+        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
 
         let mut sessions = self.rtc_sessions.write().await;
 
@@ -528,10 +433,7 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
-        if !channel.member_ids.contains(&authenticated_user.user_id) {
-            return Err("Not a channel member".to_string());
-        }
+        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
 
         let mut sessions = self.rtc_sessions.write().await;
         if let Some(session) = sessions.get_mut(&channel_id) {
@@ -579,13 +481,7 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
-        if !channel.member_ids.contains(&authenticated_user.user_id) {
-            return Err("Not a channel member".to_string());
-        }
-        if !channel.member_ids.contains(&target_user_id) {
-            return Err("Not a RTC session member".to_string());
-        }
+        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
 
         let event = Event::RTCSession {
             channel_id: channel_id.clone(),
@@ -621,13 +517,7 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
-        if !channel.member_ids.contains(&authenticated_user.user_id) {
-            return Err("Not a channel member".to_string());
-        }
-        if !channel.member_ids.contains(&target_user_id) {
-            return Err("Not a RTC session member".to_string());
-        }
+        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
 
         let event = Event::RTCSession {
             channel_id: channel_id.clone(),
@@ -663,13 +553,7 @@ impl ChatService for ChatServer {
         let authenticated_user = self.authenticate(&id_token).await?;
 
         let channels = self.channels.read().await;
-        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
-        if !channel.member_ids.contains(&authenticated_user.user_id) {
-            return Err("Not a channel member".to_string());
-        }
-        if !channel.member_ids.contains(&target_user_id) {
-            return Err("Not a RTC session member".to_string());
-        }
+        let _ = channels.get(&channel_id).ok_or("Channel not found")?;
 
         let event = Event::RTCSession {
             channel_id: channel_id.clone(),

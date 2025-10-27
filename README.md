@@ -15,16 +15,10 @@ Malguem is a Rust-based P2P voice/video chat application with centralized text m
 
 #### Channels
 
-* Visibility
-  * Public or Private
-  * Anyone in server can see existence of channel but non channel member cannot see the contents
-  * Only channel members can invite other member to the private channel
-  * Anyone in server can join to the public channel
 * Text Messages
-  * Users can chat with text messages within channel
   * Text messages are stored in server
 * RTC Sessions (= Discord voice call)
-  * Any user within the channel can start the RTC session
+  * Any user can start the RTC session
   * There can be only one RTC session for a channel
   * A user can only participate in one RTC session at a time.
   * RTC session member can broadcast their screen too

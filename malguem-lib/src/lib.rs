@@ -39,19 +39,10 @@ pub struct User {
     pub profile_image: Option<Vec<u8>>, // Under 5MiB
 }
 
-// Channel types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ChannelVisibility {
-    Public,
-    Private,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
     pub channel_id: ChannelID,
     pub name: String,
-    pub visibility: ChannelVisibility,
-    pub member_ids: HashSet<UserID>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,19 +126,8 @@ pub trait ChatService {
     ) -> Result<(), String>;
 
     // Channel operations
-    async fn create_channel(
-        id_token: String,
-        name: String,
-        visibility: ChannelVisibility,
-    ) -> Result<Channel, String>;
+    async fn create_channel(id_token: String, name: String) -> Result<Channel, String>;
     async fn list_channels(id_token: String) -> Result<Vec<Channel>, String>;
-    async fn join_channel(id_token: String, channel_id: ChannelID) -> Result<(), String>;
-    async fn leave_channel(id_token: String, channel_id: ChannelID) -> Result<(), String>;
-    async fn invite_to_channel(
-        id_token: String,
-        invitee_id: UserID,
-        channel_id: ChannelID,
-    ) -> Result<(), String>;
 
     // Message operations
     async fn send_message(

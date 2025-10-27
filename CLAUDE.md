@@ -57,7 +57,7 @@ The application uses a **hybrid communication model** with application-level mul
 
 Defined in `malguem-lib/src/lib.rs` using `#[tarpc::service]` macro:
 - User operations: join, get_me, get_user, update_profile
-- Channel operations: create_channel, list_channels, join_channel, leave_channel, invite_to_channel
+- Channel operations: create_channel, list_channels
 - Message operations: send_message, get_messages
 - RTC operations: join_rtc_session, leave_rtc_session, offer/answer/ice_candidate methods
 

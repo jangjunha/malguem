@@ -15,3 +15,5 @@
 
 * Passwordless email auth
 * Google Login linking
+
+* Private channel
