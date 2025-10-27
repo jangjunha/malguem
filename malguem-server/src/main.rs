@@ -1,6 +1,6 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{StreamExt, future};
-use heek_chat_lib::{
+use malguem_lib::{
     Channel, ChannelID, ChannelVisibility, ChatService, Event, Message, Pagination,
     PaginationDirection, RTCSession, User, UserID,
 };
@@ -71,26 +71,38 @@ impl ChatServer {
             })),
             users: Arc::new(RwLock::new({
                 let mut users = HashMap::new();
+                // FIXME:
                 users.insert(
                     uuid!("00000000-0000-0000-0000-000000000000"),
                     UserWithCredentials {
                         user: User {
                             user_id: uuid!("00000000-0000-0000-0000-000000000000"),
-                            username: "peachricecake".to_string(),
+                            username: "aaaa".to_string(),
                             profile_image: None,
                         },
-                        firebase_uid: "yx5Y3VxfAAOlSeoxoSTTXP48YSe2".to_string(),
+                        firebase_uid: "Bovit53RRDNLiIxdI3qRsXJPdtL2".to_string(),
                     },
-                ); // FIXME:
+                );
                 users.insert(
                     uuid!("00000000-0000-0000-0000-000000000001"),
                     UserWithCredentials {
                         user: User {
                             user_id: uuid!("00000000-0000-0000-0000-000000000001"),
-                            username: "jangjunha113".to_string(),
+                            username: "bbbb".to_string(),
                             profile_image: None,
                         },
-                        firebase_uid: "aIbDhjy2xcfMAEpHWLlvE320Mz32".to_string(),
+                        firebase_uid: "t4BGVVpEF3UdM3EBocjfnGGLfxy1".to_string(),
+                    },
+                );
+                users.insert(
+                    uuid!("00000000-0000-0000-0000-000000000002"),
+                    UserWithCredentials {
+                        user: User {
+                            user_id: uuid!("00000000-0000-0000-0000-000000000002"),
+                            username: "cccc".to_string(),
+                            profile_image: None,
+                        },
+                        firebase_uid: "JqaAtpBd3cddYjokqEQKMhD53SF2".to_string(),
                     },
                 );
                 users
@@ -106,6 +118,7 @@ impl ChatServer {
                         member_ids: HashSet::from([
                             uuid!("00000000-0000-0000-0000-000000000000"),
                             uuid!("00000000-0000-0000-0000-000000000001"),
+                            uuid!("00000000-0000-0000-0000-000000000002"),
                         ]),
                     },
                 );
@@ -481,7 +494,7 @@ impl ChatService for ChatServer {
         if is_new_participant {
             let event = Event::RTCSession {
                 channel_id: channel_id.clone(),
-                event: heek_chat_lib::RTCSessionEvent::UserJoined {
+                event: malguem_lib::RTCSessionEvent::UserJoined {
                     user_id: authenticated_user.user_id.clone(),
                 },
             };
@@ -531,7 +544,7 @@ impl ChatService for ChatServer {
             // Broadcast UserJoined event to all participants in the channel
             let event = Event::RTCSession {
                 channel_id: channel_id.clone(),
-                event: heek_chat_lib::RTCSessionEvent::UserLeft {
+                event: malguem_lib::RTCSessionEvent::UserLeft {
                     user_id: authenticated_user.user_id.clone(),
                 },
             };
@@ -576,7 +589,7 @@ impl ChatService for ChatServer {
 
         let event = Event::RTCSession {
             channel_id: channel_id.clone(),
-            event: heek_chat_lib::RTCSessionEvent::OfferReceived {
+            event: malguem_lib::RTCSessionEvent::OfferReceived {
                 from_user_id: authenticated_user.user_id.clone(),
                 sdp,
             },
@@ -618,7 +631,7 @@ impl ChatService for ChatServer {
 
         let event = Event::RTCSession {
             channel_id: channel_id.clone(),
-            event: heek_chat_lib::RTCSessionEvent::AnswerReceived {
+            event: malguem_lib::RTCSessionEvent::AnswerReceived {
                 from_user_id: authenticated_user.user_id.clone(),
                 sdp,
             },
@@ -660,7 +673,7 @@ impl ChatService for ChatServer {
 
         let event = Event::RTCSession {
             channel_id: channel_id.clone(),
-            event: heek_chat_lib::RTCSessionEvent::IceCandidateReceived {
+            event: malguem_lib::RTCSessionEvent::IceCandidateReceived {
                 from_user_id: authenticated_user.user_id.clone(),
                 candidate,
             },

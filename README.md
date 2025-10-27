@@ -1,3 +1,9 @@
+# Malguem
+
+🚧 WIP 🚧
+
+Malguem is a Rust-based P2P voice/video chat application with centralized text messaging capabilities. This project implements a hybrid WebRTC signaling and RPC architecture over WebSockets, with Firebase authentication and end-to-end encryption for user content.
+
 ## Requirements
 
 ### Features

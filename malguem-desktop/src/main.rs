@@ -1,5 +1,5 @@
 use eframe::egui;
-use heek_chat_lib::{Channel, ChannelID, ChatServiceClient, Event, Message, User};
+use malguem_lib::{Channel, ChannelID, ChatServiceClient, Event, Message, User};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -100,8 +100,8 @@ impl Default for App {
             firebase_token: None,
             invitation_token_input: String::new(),
             server_key: String::new(),
-            email_input: String::new(),
-            password_input: "qwer".to_string(), // FIXME:
+            email_input: "a@heek.kr".to_string(),   // FIXME:
+            password_input: "qwer1234".to_string(), // FIXME:
             username_input: String::new(),
             message_input: String::new(),
             oauth_receiver: None,
@@ -378,7 +378,7 @@ impl App {
     }
 
     fn render_login_screen(&mut self, ui: &mut egui::Ui) {
-        ui.heading("heek-chat");
+        ui.heading("Malguem");
 
         ui.add_space(20.0);
 
@@ -445,7 +445,7 @@ impl App {
 
     fn render_main_screen(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("heek-chat");
+            ui.heading("Malguem");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(user) = &self.current_user {
                     ui.label(format!("@{}", user.username));
@@ -565,7 +565,7 @@ impl App {
     }
 
     fn handle_event(&mut self, event: Event) {
-        use heek_chat_lib::{Event, RTCSessionEvent};
+        use malguem_lib::{Event, RTCSessionEvent};
 
         match event {
             Event::RTCSession { channel_id, event } => {
@@ -720,7 +720,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Heek Chat",
+        "Malguem",
         native_options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )

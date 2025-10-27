@@ -1,5 +1,5 @@
 use futures::{SinkExt, Stream, StreamExt};
-use heek_chat_lib::{
+use malguem_lib::{
     ChatServiceRequest, ChatServiceResponse, Event, MultiplexedMessage,
     tarpc::transport::MPSCTransport,
 };

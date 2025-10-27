@@ -1,10 +1,10 @@
 [package]
-name = "heek-chat-server"
+name = "malguem-server"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-heek-chat-lib = { path = "../heek-chat-lib" }
+malguem-lib = { path = "../malguem-lib" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tarpc = { version = "0.37.0", features = ["serde-transport", "tokio1", "tcp"] }

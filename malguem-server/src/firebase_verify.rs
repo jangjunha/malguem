@@ -2,7 +2,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const FIREBASE_PROJECT_ID: &str = "heek-chat";
+const FIREBASE_PROJECT_ID: &str = "my-name-is-malguem";
 const FIREBASE_PUBLIC_KEYS_URL: &str =
     "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com";
 

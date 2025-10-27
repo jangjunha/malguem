@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Heek-chat is a Rust-based chat application with text messaging and P2P voice/video calls. The project consists of three workspace members:
-- **heek-chat-lib**: Shared types, RPC service definitions, and transport utilities
-- **heek-chat-server**: Backend server handling authentication, channels, and signaling
-- **heek-chat-desktop**: egui-based desktop client application
+Malguem is a Rust-based chat application with text messaging and P2P voice/video calls. The project consists of three workspace members:
+- **malguem-lib**: Shared types, RPC service definitions, and transport utilities
+- **malguem-server**: Backend server handling authentication, channels, and signaling
+- **malguem-desktop**: egui-based desktop client application
 
 ## Build Commands
 
@@ -16,9 +16,9 @@ Heek-chat is a Rust-based chat application with text messaging and P2P voice/vid
 cargo build
 
 # Build specific package
-cargo build --package heek-chat-server
-cargo build --package heek-chat-desktop
-cargo build --package heek-chat-lib
+cargo build --package malguem-server
+cargo build --package malguem-desktop
+cargo build --package malguem-lib
 ```
 
 ## Architecture
@@ -42,7 +42,7 @@ The application uses a **hybrid communication model** with application-level mul
      - **Incoming task**: Demultiplexes WebSocket messages into RPC requests (events from clients are ignored)
      - **Outgoing task**: Multiplexes RPC responses and server events using `tokio::select!`
    - Connection cleanup via oneshot channel that signals when WebSocket tasks exit
-   - See `heek-chat-server/src/connection.rs` for implementation
+   - See `malguem-server/src/connection.rs` for implementation
 
 ### Authentication Flow
 
@@ -55,7 +55,7 @@ The application uses a **hybrid communication model** with application-level mul
 
 ### RPC Service Definition
 
-Defined in `heek-chat-lib/src/lib.rs` using `#[tarpc::service]` macro:
+Defined in `malguem-lib/src/lib.rs` using `#[tarpc::service]` macro:
 - User operations: join, get_me, get_user, update_profile
 - Channel operations: create_channel, list_channels, join_channel, leave_channel, invite_to_channel
 - Message operations: send_message, get_messages
@@ -95,7 +95,7 @@ Defined in `heek-chat-lib/src/lib.rs` using `#[tarpc::service]` macro:
 
 ## Key Implementation Details
 
-### Desktop Client (`heek-chat-desktop/src/main.rs`)
+### Desktop Client (`malguem-desktop/src/main.rs`)
 
 - **App struct**: Main application state with tokio runtime
 - **OAuth flow**: Temporary HTTP server on random port for Google sign-in callbacks
@@ -103,7 +103,7 @@ Defined in `heek-chat-lib/src/lib.rs` using `#[tarpc::service]` macro:
 - **Event handling**: Polls event receiver in `check_events()` during UI update loop
 - **UI**: egui immediate mode GUI with login screen and main chat interface
 
-### Server (`heek-chat-server/src/main.rs`)
+### Server (`malguem-server/src/main.rs`)
 
 - **ChatServer**: Clone-able struct with Arc-wrapped storage
   - `user_connections`: Maps UserID to set of ConnectionIDs (supports multiple connections per user)
@@ -123,7 +123,7 @@ Defined in `heek-chat-lib/src/lib.rs` using `#[tarpc::service]` macro:
 
 ### Connection Lifecycle
 
-**Connection establishment** (`heek-chat-server/src/connection.rs`):
+**Connection establishment** (`malguem-server/src/connection.rs`):
 1. TCP connection accepted and upgraded to WebSocket
 2. WebSocket split into read/write halves
 3. Oneshot channel created for disconnect signaling
@@ -133,7 +133,7 @@ Defined in `heek-chat-lib/src/lib.rs` using `#[tarpc::service]` macro:
 5. Both tasks signal disconnect via oneshot channel when they exit
 6. Connection struct returned with RPC transport, event sender, and disconnect receiver
 
-**Connection registration** (`heek-chat-server/src/main.rs`):
+**Connection registration** (`malguem-server/src/main.rs`):
 1. Unique ConnectionID generated
 2. Event sender stored in `event_senders` map by ConnectionID
 3. Cleanup task spawned, waiting on `disconnect_rx`

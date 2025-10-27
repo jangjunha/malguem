@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-const FIREBASE_API_KEY: &str = "AIzaSyDddynxPugKEM6aCTKjOxsmiPvZurBCfVo";
+const FIREBASE_API_KEY: &str = "AIzaSyDXl0DrNNA2uhU4C1hokcNYoIO3kNfWjKo";
 const FIREBASE_AUTH_CLIENT_ID: &str =
-    "447805294208-26bu71mrsijvcucn8vrkn2tu2oo63o4i.apps.googleusercontent.com";
+    "82041041659-q6ieoprejlslqnqmpmgriev4u91tl67e.apps.googleusercontent.com";
 const FIREBASE_AUTH_API: &str = "https://identitytoolkit.googleapis.com/v1";
 const FIREBASE_TOKEN_API: &str = "https://securetoken.googleapis.com/v1";
 

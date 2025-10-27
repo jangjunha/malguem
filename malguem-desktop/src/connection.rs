@@ -1,7 +1,5 @@
 use futures::{SinkExt, StreamExt};
-use heek_chat_lib::{
-    ChatServiceClient, Event, MultiplexedMessage, tarpc::transport::MPSCTransport,
-};
+use malguem_lib::{ChatServiceClient, Event, MultiplexedMessage, tarpc::transport::MPSCTransport};
 use tarpc::{ClientMessage, Response};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio_tungstenite::{

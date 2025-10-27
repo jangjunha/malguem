@@ -14,7 +14,7 @@ use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::TrackLocal;
 use interceptor::registry::Registry;
 
-use heek_chat_lib::{ChannelID, ChatServiceClient, UserID};
+use malguem_lib::{ChannelID, ChatServiceClient, UserID};
 
 /// Represents a single peer connection to another user in an RTC session
 pub struct PeerConnection {
