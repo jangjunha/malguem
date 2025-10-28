@@ -7,7 +7,10 @@ use std::sync::Arc;
 use tarpc::{ClientMessage, Response};
 use tokio::{
     net::{TcpListener, ToSocketAddrs},
-    sync::{mpsc::{unbounded_channel, UnboundedSender}, oneshot},
+    sync::{
+        mpsc::{UnboundedSender, unbounded_channel},
+        oneshot,
+    },
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -19,10 +22,7 @@ pub struct Connection {
 
 pub async fn listen<A: ToSocketAddrs>(
     addr: A,
-) -> Result<
-    impl Stream<Item = Result<Connection, std::io::Error>>,
-    std::io::Error,
-> {
+) -> Result<impl Stream<Item = Result<Connection, std::io::Error>>, std::io::Error> {
     let listener = TcpListener::bind(addr).await?;
 
     Ok(async_stream::stream! {

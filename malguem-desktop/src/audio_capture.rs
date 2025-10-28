@@ -1,24 +1,28 @@
+use bytes::Bytes;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
 use opus::{Application, Channels, Encoder};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
-use webrtc::track::track_local::TrackLocalWriter;
+use webrtc::api::media_engine::MIME_TYPE_OPUS;
+use webrtc::media::Sample;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 const SAMPLE_RATE: u32 = 48000; // Opus works best at 48kHz
-const CHANNELS: u16 = 1; // Mono audio
 const FRAME_SIZE: usize = 960; // 20ms at 48kHz (48000 * 0.02)
 
 pub struct AudioCapture {
     #[allow(dead_code)]
     stream: Stream,
-    track: Arc<TrackLocalStaticRTP>,
+    track: Arc<TrackLocalStaticSample>,
 }
 
 impl AudioCapture {
     /// Start capturing audio from the default microphone
-    pub fn start(runtime: Arc<tokio::runtime::Runtime>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn start(
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Get the default audio host
         let host = cpal::default_host();
 
@@ -34,13 +38,12 @@ impl AudioCapture {
         tracing::info!("Default input config: {:?}", config);
 
         // Create WebRTC audio track
-        let track = Arc::new(TrackLocalStaticRTP::new(
+        let track: Arc<TrackLocalStaticSample> = Arc::new(TrackLocalStaticSample::new(
             webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
-                mime_type: "audio/opus".to_string(),
+                mime_type: MIME_TYPE_OPUS.to_string(),
                 clock_rate: 48000,
                 channels: 1,
-                sdp_fmtp_line: "".to_string(),
-                rtcp_feedback: vec![],
+                ..Default::default()
             },
             "audio".to_string(),
             "webrtc-rs".to_string(),
@@ -59,9 +62,15 @@ impl AudioCapture {
 
         // Build the input stream
         let stream = match config.sample_format() {
-            SampleFormat::F32 => Self::build_input_stream::<f32>(&device, &config.into(), audio_tx)?,
-            SampleFormat::I16 => Self::build_input_stream::<i16>(&device, &config.into(), audio_tx)?,
-            SampleFormat::U16 => Self::build_input_stream::<u16>(&device, &config.into(), audio_tx)?,
+            SampleFormat::F32 => {
+                Self::build_input_stream::<f32>(&device, &config.into(), audio_tx)?
+            }
+            SampleFormat::I16 => {
+                Self::build_input_stream::<i16>(&device, &config.into(), audio_tx)?
+            }
+            SampleFormat::U16 => {
+                Self::build_input_stream::<u16>(&device, &config.into(), audio_tx)?
+            }
             format => return Err(format!("Unsupported sample format: {:?}", format).into()),
         };
 
@@ -113,7 +122,7 @@ impl AudioCapture {
 
     /// Audio processing task that encodes and sends audio
     async fn audio_processing_task(
-        track: Arc<TrackLocalStaticRTP>,
+        track: Arc<TrackLocalStaticSample>,
         audio_rx: &mut mpsc::UnboundedReceiver<Vec<f32>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Create Opus encoder
@@ -139,20 +148,16 @@ impl AudioCapture {
                     encoded.truncate(size);
 
                     // Write RTP packet
-                    if let Err(e) = track.write_rtp(&rtp::packet::Packet {
-                        header: rtp::header::Header {
-                            version: 2,
-                            padding: false,
-                            extension: false,
-                            marker: false,
-                            payload_type: 111, // Opus payload type
-                            sequence_number,
-                            timestamp,
-                            ssrc: rand::random(),
+                    if let Err(e) = track
+                        .write_sample(&Sample {
+                            data: Bytes::from(encoded),
+                            duration: Duration::from_secs_f64(
+                                FRAME_SIZE as f64 / SAMPLE_RATE as f64,
+                            ),
                             ..Default::default()
-                        },
-                        payload: encoded.into(),
-                    }).await {
+                        })
+                        .await
+                    {
                         tracing::error!("Failed to write RTP packet: {}", e);
                     }
 
@@ -169,7 +174,7 @@ impl AudioCapture {
     }
 
     /// Get the audio track for adding to peer connections
-    pub fn track(&self) -> Arc<TrackLocalStaticRTP> {
+    pub fn track(&self) -> Arc<TrackLocalStaticSample> {
         Arc::clone(&self.track)
     }
 }

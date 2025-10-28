@@ -65,7 +65,8 @@ pub struct Message {
 pub struct RTCSession {
     pub channel_id: ChannelID,
     pub participants: HashSet<UserID>,
-    // pub encryption_keys: Vec<EncryptionKey>, // Per-sender keys
+    pub screen_sharers: HashSet<UserID>, // Users currently sharing their screen
+                                         // pub encryption_keys: Vec<EncryptionKey>, // Per-sender keys
 }
 
 impl RTCSession {
@@ -73,6 +74,7 @@ impl RTCSession {
         Self {
             channel_id: channel_id.clone(),
             participants: HashSet::new(),
+            screen_sharers: HashSet::new(),
         }
     }
 }
@@ -114,6 +116,12 @@ pub enum RTCSessionEvent {
     IceCandidateReceived {
         from_user_id: UserID,
         candidate: String,
+    },
+    ScreenShareStarted {
+        user_id: UserID,
+    },
+    ScreenShareStopped {
+        user_id: UserID,
     },
 }
 
@@ -177,4 +185,8 @@ pub trait ChatService {
         target_user_id: UserID,
         candidate: String,
     ) -> Result<(), String>;
+
+    // Screen sharing operations
+    async fn start_screen_share(id_token: String, channel_id: ChannelID) -> Result<(), String>;
+    async fn stop_screen_share(id_token: String, channel_id: ChannelID) -> Result<(), String>;
 }

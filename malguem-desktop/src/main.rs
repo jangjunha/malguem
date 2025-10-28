@@ -9,11 +9,14 @@ use firebase_auth::FirebaseAuth;
 use crate::audio_capture::AudioCapture;
 use crate::connection::Connection;
 use crate::rtc::RTCSessionManager;
+use crate::screen_capture::ScreenCapture;
 
 mod audio_capture;
 mod audio_playback;
 mod connection;
 mod rtc;
+mod screen_capture;
+mod video_playback;
 
 struct CurrentMessageChannel {
     channel_id: ChannelID,
@@ -34,6 +37,7 @@ struct CurrentRTCSession {
     manager: Arc<RTCSessionManager>,
     #[allow(dead_code)]
     audio_capture: Option<AudioCapture>,
+    screen_capture: Option<ScreenCapture>,
 }
 
 impl CurrentRTCSession {
@@ -46,6 +50,7 @@ impl CurrentRTCSession {
             channel_id: channel_id.clone(),
             manager,
             audio_capture,
+            screen_capture: None,
         }
     }
 }
@@ -55,6 +60,7 @@ struct App {
     connected: bool,
     server_address: String,
     connection_error: Option<String>,
+    screen_share_error: Option<String>,
 
     // Firebase Auth
     firebase_auth: FirebaseAuth,
@@ -95,6 +101,7 @@ impl Default for App {
             connected: false,
             server_address: "ws://127.0.0.1:8080".to_string(),
             connection_error: None,
+            screen_share_error: None,
             firebase_auth,
             current_user: None,
             firebase_token: None,
@@ -322,6 +329,94 @@ impl App {
         }
     }
 
+    fn start_screen_share(&mut self) {
+        // Clear previous error
+        self.screen_share_error = None;
+
+        if let (Some(client), Some(firebase_token), Some(session)) = (
+            &self.rpc,
+            &self.firebase_token,
+            &mut self.current_rtc_session,
+        ) {
+            let runtime = self.runtime.clone();
+            let client = client.clone();
+            let firebase_token = firebase_token.clone();
+            let manager = Arc::clone(&session.manager);
+            let channel_id = session.channel_id.clone();
+
+            // Start screen capture
+            match ScreenCapture::start(runtime.clone()) {
+                Ok(screen_capture) => {
+                    let screen_track = screen_capture.track();
+
+                    // Add screen track to all peer connections
+                    let result = runtime.block_on(async move {
+                        if let Err(e) = manager.set_screen_track(screen_track).await {
+                            return Err(format!("Failed to set screen track: {}", e));
+                        }
+
+                        // Notify server
+                        client
+                            .start_screen_share(
+                                tarpc::context::current(),
+                                firebase_token,
+                                channel_id,
+                            )
+                            .await
+                            .map_err(|e| format!("RPC error: {}", e))?
+                    });
+
+                    match result {
+                        Ok(()) => {
+                            session.screen_capture = Some(screen_capture);
+                            tracing::info!("Started screen sharing");
+                        }
+                        Err(e) => {
+                            let error_msg = format!("Failed to start screen sharing: {}", e);
+                            tracing::error!("{}", error_msg);
+                            self.screen_share_error = Some(error_msg);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to initialize screen capture: {}", e);
+                    tracing::error!("{}", error_msg);
+                    self.screen_share_error = Some(error_msg);
+                }
+            }
+        }
+    }
+
+    fn stop_screen_share(&mut self) {
+        if let (Some(client), Some(firebase_token), Some(session)) = (
+            &self.rpc,
+            &self.firebase_token,
+            &mut self.current_rtc_session,
+        ) {
+            let runtime = self.runtime.clone();
+            let client = client.clone();
+            let firebase_token = firebase_token.clone();
+            let manager = Arc::clone(&session.manager);
+            let channel_id = session.channel_id.clone();
+
+            let _ = runtime.block_on(async move {
+                // Remove screen track from peer connections
+                if let Err(e) = manager.remove_screen_track().await {
+                    tracing::error!("Failed to remove screen track: {}", e);
+                }
+
+                // Notify server
+                client
+                    .stop_screen_share(tarpc::context::current(), firebase_token, channel_id)
+                    .await
+            });
+
+            // Drop screen capture (will stop capture thread)
+            session.screen_capture = None;
+            tracing::info!("Stopped screen sharing");
+        }
+    }
+
     fn connect_to_server_with_firebase_token(&mut self, firebase_token: String) {
         let addr = self.server_address.clone();
         let runtime = self.runtime.clone();
@@ -528,6 +623,42 @@ impl App {
 
             ui.separator();
 
+            // Screen sharing controls (only show when in RTC session)
+            let is_in_rtc_session = self.current_rtc_session.is_some();
+            let is_sharing = self.current_rtc_session.as_ref()
+                .map(|s| s.screen_capture.is_some())
+                .unwrap_or(false);
+
+            if is_in_rtc_session {
+                ui.vertical(|ui| {
+                    ui.heading("Screen Sharing");
+
+                    let button_text = if is_sharing {
+                        "⏹ Stop Sharing Screen"
+                    } else {
+                        "▶ Share Screen"
+                    };
+
+                    if ui.button(button_text).clicked() {
+                        if is_sharing {
+                            self.stop_screen_share();
+                        } else {
+                            self.start_screen_share();
+                        }
+                    }
+
+                    // Show screen share error if any
+                    if let Some(error) = &self.screen_share_error {
+                        ui.add_space(5.0);
+                        ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+                        ui.label("Note: On macOS, you may need to grant Screen Recording permission in System Settings > Privacy & Security");
+                    }
+                });
+                ui.separator();
+            }
+
+            ui.separator();
+
             // Chat area
             ui.vertical(|ui| {
                 ui.set_height(available_height);
@@ -680,6 +811,23 @@ impl App {
                                     tracing::error!("Failed to handle ICE candidate: {}", e);
                                 }
                             });
+                        }
+                        RTCSessionEvent::ScreenShareStarted { user_id } => {
+                            tracing::info!(
+                                "User {} started screen sharing in channel {}",
+                                user_id,
+                                channel_id
+                            );
+                            // Screen share started event - peers will receive the video track
+                            // through the normal WebRTC negotiation
+                        }
+                        RTCSessionEvent::ScreenShareStopped { user_id } => {
+                            tracing::info!(
+                                "User {} stopped screen sharing in channel {}",
+                                user_id,
+                                channel_id
+                            );
+                            // Screen share stopped event
                         }
                     }
                 } else {

@@ -1,18 +1,21 @@
+use interceptor::registry::Registry;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::Duration;
+use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::track::track_local::TrackLocal;
-use interceptor::registry::Registry;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use malguem_lib::{ChannelID, ChatServiceClient, UserID};
 
@@ -35,8 +38,6 @@ impl PeerConnection {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create a MediaEngine
         let mut media_engine = MediaEngine::default();
-
-        // Register default codecs (Opus for audio, VP8/VP9 for video)
         media_engine.register_default_codecs()?;
 
         // Create an InterceptorRegistry
@@ -61,54 +62,119 @@ impl PeerConnection {
         // Create a new RTCPeerConnection
         let peer_conn = Arc::new(api.new_peer_connection(config).await?);
 
+        // Allow us to receive 1 audio track, and 1 video track
+        peer_conn
+            .add_transceiver_from_kind(RTPCodecType::Audio, None)
+            .await?;
+        peer_conn
+            .add_transceiver_from_kind(RTPCodecType::Video, None)
+            .await?;
+
         // Set up ICE candidate handler
         let ice_tx = ice_candidate_tx.clone();
         let peer_user_id = user_id.clone();
-        peer_conn
-            .on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-                let tx = ice_tx.clone();
-                let uid = peer_user_id.clone();
+        peer_conn.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+            let tx = ice_tx.clone();
+            let uid = peer_user_id.clone();
+            Box::pin(async move {
+                if let Some(candidate) = candidate {
+                    let _ = tx.send((uid, candidate));
+                }
+            })
+        }));
+
+        // Set up connection state handler
+        peer_conn.on_peer_connection_state_change(Box::new(
+            move |state: RTCPeerConnectionState| {
+                tracing::info!("Peer connection state changed: {:?}", state);
+                Box::pin(async {})
+            },
+        ));
+
+        // Set up track handler for receiving remote audio and video
+        {
+            let runtime_for_track = Arc::clone(&runtime);
+            let peer_user_id_for_track = user_id.clone();
+            let pc = Arc::downgrade(&peer_conn);
+            peer_conn.on_track(Box::new(move |track, _, _| {
+                let media_ssrc = track.ssrc();
+                tracing::info!("===== RECEIVED REMOTE TRACK =====");
+                tracing::info!("Track ID: {}", track.id());
+                tracing::info!("Track Kind: {:?}", track.kind());
+                tracing::info!("Track Codec: {:?}", track.codec());
+                tracing::info!("Track SSRC: {:?}", media_ssrc);
+                tracing::info!("User ID: {}", peer_user_id_for_track);
+                tracing::info!("================================");
+
+                // Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
+                {
+                    let pc = pc.clone();
+                    runtime_for_track.spawn(async move {
+                        let mut result = Result::<usize, webrtc::Error>::Ok(0);
+                        while result.is_ok() {
+                            let timeout = tokio::time::sleep(Duration::from_secs(3));
+                            tokio::pin!(timeout);
+
+                            tokio::select! {
+                                _ = timeout.as_mut() =>{
+                                    if let Some(pc) = pc.upgrade() {
+                                        result = pc.write_rtcp(&[Box::new(PictureLossIndication{
+                                            sender_ssrc: 0,
+                                            media_ssrc,
+                                        })]).await;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            };
+                        }
+                    });
+                };
+
+                let track_clone = Arc::clone(&track);
+                let runtime_clone = Arc::clone(&runtime_for_track);
                 Box::pin(async move {
-                    if let Some(candidate) = candidate {
-                        let _ = tx.send((uid, candidate));
+                    if track.kind() == RTPCodecType::Audio {
+                        // Start audio playback for this track
+                        std::thread::spawn(move || {
+                            use crate::audio_playback::AudioPlayback;
+                            match AudioPlayback::start(track_clone, runtime_clone) {
+                                Ok(playback) => {
+                                    tracing::info!("Audio playback started");
+                                    // Keep playback alive by keeping it in scope
+                                    std::thread::park();
+                                    drop(playback);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to start audio playback: {}", e);
+                                }
+                            }
+                        });
+                    } else if track.kind() == RTPCodecType::Video {
+                        // Start video playback for this track
+                        let user_id_for_video = peer_user_id_for_track.clone();
+                        std::thread::spawn(move || {
+                            use crate::video_playback::VideoPlayback;
+                            match VideoPlayback::start(
+                                user_id_for_video,
+                                track_clone,
+                                runtime_clone,
+                            ) {
+                                Ok(playback) => {
+                                    tracing::info!("Video playback started");
+                                    // Keep playback alive by keeping it in scope
+                                    std::thread::park();
+                                    drop(playback);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to start video playback: {}", e);
+                                }
+                            }
+                        });
                     }
                 })
             }));
-
-        // Set up connection state handler
-        peer_conn
-            .on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
-                tracing::info!("Peer connection state changed: {:?}", state);
-                Box::pin(async {})
-            }));
-
-        // Set up track handler for receiving remote audio
-        let runtime_for_track = Arc::clone(&runtime);
-        peer_conn.on_track(Box::new(move |track, _, _| {
-            tracing::info!("Received remote track: {} ({})", track.id(), track.kind());
-
-            if track.kind() == webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio {
-                // Start audio playback for this track
-                let track_clone = Arc::clone(&track);
-                let runtime_clone = Arc::clone(&runtime_for_track);
-                std::thread::spawn(move || {
-                    use crate::audio_playback::AudioPlayback;
-                    match AudioPlayback::start(track_clone, runtime_clone) {
-                        Ok(playback) => {
-                            tracing::info!("Audio playback started");
-                            // Keep playback alive by keeping it in scope
-                            std::thread::park();
-                            drop(playback);
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to start audio playback: {}", e);
-                        }
-                    }
-                });
-            }
-
-            Box::pin(async {})
-        }));
+        };
 
         Ok(Self {
             peer_conn,
@@ -121,9 +187,9 @@ impl PeerConnection {
 
     /// Add a transceiver for audio (creates an m-line in SDP)
     pub async fn add_audio_transceiver(&self) -> Result<(), Box<dyn std::error::Error>> {
+        use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
         use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
         use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
-        use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 
         // Add a recvonly audio transceiver to ensure we have an m=audio line in the SDP
         let init = RTCRtpTransceiverInit {
@@ -131,10 +197,28 @@ impl PeerConnection {
             send_encodings: vec![],
         };
 
-        self.peer_conn.add_transceiver_from_kind(
-            RTPCodecType::Audio,
-            Some(init),
-        ).await?;
+        self.peer_conn
+            .add_transceiver_from_kind(RTPCodecType::Audio, Some(init))
+            .await?;
+
+        Ok(())
+    }
+
+    /// Add a transceiver for video (creates an m-line in SDP)
+    pub async fn add_video_transceiver(&self) -> Result<(), Box<dyn std::error::Error>> {
+        use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+        use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+
+        // Add a recvonly video transceiver to ensure we have an m=video line in the SDP
+        let init = RTCRtpTransceiverInit {
+            direction: RTCRtpTransceiverDirection::Recvonly,
+            send_encodings: vec![],
+        };
+
+        self.peer_conn
+            .add_transceiver_from_kind(RTPCodecType::Video, Some(init))
+            .await?;
 
         Ok(())
     }
@@ -142,15 +226,14 @@ impl PeerConnection {
     /// Create an offer for this peer connection
     pub async fn create_offer(&self) -> Result<RTCSessionDescription, Box<dyn std::error::Error>> {
         let offer = self.peer_conn.create_offer(None).await?;
+        tracing::debug!("Created offer SDP:\n{}", offer.sdp);
         self.peer_conn.set_local_description(offer.clone()).await?;
         Ok(offer)
     }
 
     /// Set remote description (offer from remote peer)
-    pub async fn set_remote_offer(
-        &self,
-        sdp: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn set_remote_offer(&self, sdp: String) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::debug!("Received offer SDP:\n{}", sdp);
         let offer = RTCSessionDescription::offer(sdp)?;
         self.peer_conn.set_remote_description(offer).await?;
 
@@ -163,15 +246,14 @@ impl PeerConnection {
     /// Create an answer for this peer connection
     pub async fn create_answer(&self) -> Result<RTCSessionDescription, Box<dyn std::error::Error>> {
         let answer = self.peer_conn.create_answer(None).await?;
+        tracing::debug!("Created answer SDP:\n{}", answer.sdp);
         self.peer_conn.set_local_description(answer.clone()).await?;
         Ok(answer)
     }
 
     /// Set remote description (answer from remote peer)
-    pub async fn set_remote_answer(
-        &self,
-        sdp: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn set_remote_answer(&self, sdp: String) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::debug!("Received answer SDP:\n{}", sdp);
         let answer = RTCSessionDescription::answer(sdp)?;
         self.peer_conn.set_remote_description(answer).await?;
 
@@ -217,25 +299,25 @@ impl PeerConnection {
         Ok(())
     }
 
-    /// Add an audio track to this peer connection
-    pub async fn add_audio_track(
+    /// Add a track to this peer connection
+    pub async fn add_track(
         &self,
-        track: Arc<TrackLocalStaticRTP>,
+        track: Arc<TrackLocalStaticSample>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.peer_conn
+        let sender = self
+            .peer_conn
             .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
             .await?;
-        Ok(())
-    }
 
-    /// Add a video track to this peer connection
-    pub async fn add_video_track(
-        &self,
-        track: Arc<TrackLocalStaticRTP>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.peer_conn
-            .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await?;
+        // Read incoming RTCP packets
+        // Before these packets are returned they are processed by interceptors. For things
+        // like NACK this needs to be called.
+        self.runtime.spawn(async move {
+            let mut rtcp_buf = vec![0u8; 1500];
+            while let Ok((_, _)) = sender.read(&mut rtcp_buf).await {}
+            Result::<(), ()>::Ok(())
+        });
+
         Ok(())
     }
 
@@ -243,10 +325,6 @@ impl PeerConnection {
     pub async fn close(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.peer_conn.close().await?;
         Ok(())
-    }
-
-    pub fn peer_connection(&self) -> Arc<RTCPeerConnection> {
-        Arc::clone(&self.peer_conn)
     }
 }
 
@@ -260,7 +338,8 @@ pub struct RTCSessionManager {
     ice_candidate_tx: mpsc::UnboundedSender<(UserID, RTCIceCandidate)>,
     ice_candidate_rx: Arc<Mutex<mpsc::UnboundedReceiver<(UserID, RTCIceCandidate)>>>,
     runtime: Arc<tokio::runtime::Runtime>,
-    local_audio_track: Option<Arc<TrackLocalStaticRTP>>,
+    local_audio_track: Option<Arc<TrackLocalStaticSample>>,
+    local_screen_track: Arc<Mutex<Option<Arc<TrackLocalStaticSample>>>>,
 }
 
 impl RTCSessionManager {
@@ -271,7 +350,7 @@ impl RTCSessionManager {
         rpc_client: ChatServiceClient,
         firebase_token: String,
         runtime: Arc<tokio::runtime::Runtime>,
-        local_audio_track: Option<Arc<TrackLocalStaticRTP>>,
+        local_audio_track: Option<Arc<TrackLocalStaticSample>>,
     ) -> Self {
         let (ice_candidate_tx, ice_candidate_rx) = mpsc::unbounded_channel();
 
@@ -285,6 +364,7 @@ impl RTCSessionManager {
             ice_candidate_rx: Arc::new(Mutex::new(ice_candidate_rx)),
             runtime,
             local_audio_track,
+            local_screen_track: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -337,16 +417,17 @@ impl RTCSessionManager {
         user_id: UserID,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if user_id == self.current_user_id {
-            // Don't create a connection to ourselves
             return Ok(());
         }
 
         // Offer collision resolution: only the peer with the higher user ID creates the offer
         // This prevents both peers from sending offers simultaneously
         let should_create_offer = self.current_user_id > user_id;
-
         if !should_create_offer {
-            tracing::info!("Not creating offer for user {} (waiting for their offer)", user_id);
+            tracing::info!(
+                "Not creating offer for user {} (waiting for their offer)",
+                user_id
+            );
             return Ok(());
         }
 
@@ -364,15 +445,21 @@ impl RTCSessionManager {
         );
 
         // Store the peer connection
-        self.peers.lock().await.insert(user_id.clone(), peer.clone());
+        self.peers
+            .lock()
+            .await
+            .insert(user_id.clone(), peer.clone());
 
         // Add local audio track if available
         if let Some(track) = &self.local_audio_track {
             tracing::info!("Adding local audio track to peer connection");
-            peer.add_audio_track(Arc::clone(track)).await?;
-        } else {
-            // Add audio transceiver to ensure m-line in SDP (recvonly if no local track)
-            peer.add_audio_transceiver().await?;
+            peer.add_track(Arc::clone(track)).await?;
+        }
+
+        // Add local screen track if available
+        if let Some(track) = &*self.local_screen_track.lock().await {
+            tracing::info!("Adding local screen track to peer connection");
+            peer.add_track(Arc::clone(track)).await?;
         }
 
         // Create and send offer
@@ -442,7 +529,13 @@ impl RTCSessionManager {
         // Add local audio track if available (before setting remote description)
         if let Some(track) = &self.local_audio_track {
             tracing::info!("Adding local audio track to peer connection");
-            peer.add_audio_track(Arc::clone(track)).await?;
+            peer.add_track(Arc::clone(track)).await?;
+        }
+
+        // Add local screen track if available (before setting remote description)
+        if let Some(track) = &*self.local_screen_track.lock().await {
+            tracing::info!("Adding local screen track to peer connection");
+            peer.add_track(Arc::clone(track)).await?;
         }
 
         // Set the remote offer
@@ -522,5 +615,65 @@ impl RTCSessionManager {
     /// Get a peer connection by user ID
     pub async fn get_peer(&self, user_id: &UserID) -> Option<Arc<PeerConnection>> {
         self.peers.lock().await.get(user_id).map(Arc::clone)
+    }
+
+    /// Set screen sharing track and add it to all existing peer connections
+    pub async fn set_screen_track(
+        &self,
+        track: Arc<TrackLocalStaticSample>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::info!("===== SETTING SCREEN TRACK =====");
+
+        // Store the track
+        *self.local_screen_track.lock().await = Some(Arc::clone(&track));
+
+        // Add to all existing peer connections and renegotiate
+        let peers = self.peers.lock().await;
+        tracing::info!("Number of existing peers: {}", peers.len());
+
+        for (user_id, peer) in peers.iter() {
+            tracing::info!(
+                "Adding screen track to peer connection for user {}",
+                user_id
+            );
+            peer.add_track(Arc::clone(&track)).await?;
+
+            // Renegotiate by creating and sending a new offer
+            tracing::info!(
+                "Renegotiating connection with user {} after adding video track",
+                user_id
+            );
+            let offer = peer.create_offer().await?;
+
+            tracing::info!("Sending renegotiation offer to user {}", user_id);
+            self.rpc_client
+                .offer_rtc_connection(
+                    tarpc::context::current(),
+                    self.firebase_token.clone(),
+                    self.channel_id.clone(),
+                    user_id.clone(),
+                    offer.sdp,
+                )
+                .await??;
+            tracing::info!("Renegotiation offer sent successfully to user {}", user_id);
+        }
+
+        tracing::info!("===== SCREEN TRACK SET COMPLETE =====");
+        Ok(())
+    }
+
+    /// Remove screen sharing track from all peer connections
+    pub async fn remove_screen_track(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Clear the stored track
+        *self.local_screen_track.lock().await = None;
+
+        // Note: WebRTC doesn't have a direct way to remove tracks after they've been added
+        // In a production system, you would need to renegotiate the connection
+        // For now, we just clear the reference
+        tracing::info!(
+            "Screen sharing track removed (renegotiation required for complete removal)"
+        );
+
+        Ok(())
     }
 }

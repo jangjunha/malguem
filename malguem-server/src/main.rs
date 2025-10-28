@@ -609,6 +609,112 @@ impl ChatService for ChatServer {
 
         Ok(())
     }
+
+    async fn start_screen_share(
+        self,
+        _: context::Context,
+        id_token: String,
+        channel_id: ChannelID,
+    ) -> Result<(), String> {
+        let authenticated_user = self.authenticate(&id_token).await?;
+
+        let channels = self.channels.read().await;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if channel.r#type != ChannelType::RTC {
+            return Err("Operation not allowed on non-rtc channel".to_string());
+        }
+
+        let mut sessions = self.rtc_sessions.write().await;
+        let session = sessions.get_mut(&channel_id).ok_or("Not in RTC session")?;
+
+        // Check if user is already sharing screen
+        if session.screen_sharers.contains(&authenticated_user.user_id) {
+            return Err("Already sharing screen".to_string());
+        }
+
+        // Add to screen sharers
+        session
+            .screen_sharers
+            .insert(authenticated_user.user_id.clone());
+
+        // Broadcast ScreenShareStarted event to all participants in the channel
+        let event = Event::RTCSession {
+            channel_id: channel_id.clone(),
+            event: malguem_lib::RTCSessionEvent::ScreenShareStarted {
+                user_id: authenticated_user.user_id.clone(),
+            },
+        };
+        let event_senders = self.event_senders.read().await;
+        let user_connections = self.user_connections.read().await;
+
+        for participant_id in &session.participants {
+            if participant_id == &authenticated_user.user_id {
+                continue;
+            }
+            // Send event to all connections for this participant
+            if let Some(connection_ids) = user_connections.get(participant_id) {
+                for connection_id in connection_ids {
+                    if let Some(sender) = event_senders.get(connection_id) {
+                        let _ = sender.send(event.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn stop_screen_share(
+        self,
+        _: context::Context,
+        id_token: String,
+        channel_id: ChannelID,
+    ) -> Result<(), String> {
+        let authenticated_user = self.authenticate(&id_token).await?;
+
+        let channels = self.channels.read().await;
+        let channel = channels.get(&channel_id).ok_or("Channel not found")?;
+        if channel.r#type != ChannelType::RTC {
+            return Err("Operation not allowed on non-rtc channel".to_string());
+        }
+
+        let mut sessions = self.rtc_sessions.write().await;
+        let session = sessions.get_mut(&channel_id).ok_or("Not in RTC session")?;
+
+        // Check if user is sharing screen
+        if !session.screen_sharers.contains(&authenticated_user.user_id) {
+            return Err("Not sharing screen".to_string());
+        }
+
+        // Remove from screen sharers
+        session.screen_sharers.remove(&authenticated_user.user_id);
+
+        // Broadcast ScreenShareStopped event to all participants in the channel
+        let event = Event::RTCSession {
+            channel_id: channel_id.clone(),
+            event: malguem_lib::RTCSessionEvent::ScreenShareStopped {
+                user_id: authenticated_user.user_id.clone(),
+            },
+        };
+        let event_senders = self.event_senders.read().await;
+        let user_connections = self.user_connections.read().await;
+
+        for participant_id in &session.participants {
+            if participant_id == &authenticated_user.user_id {
+                continue;
+            }
+            // Send event to all connections for this participant
+            if let Some(connection_ids) = user_connections.get(participant_id) {
+                for connection_id in connection_ids {
+                    if let Some(sender) = event_senders.get(connection_id) {
+                        let _ = sender.send(event.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[tokio::main]
