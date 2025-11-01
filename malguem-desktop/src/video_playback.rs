@@ -58,8 +58,8 @@ impl VideoPlayback {
         let mut decoder = Decoder::new()?;
 
         // Create SampleBuilder with H264Packet depacketizer
-        // max_late: 512, sample_rate: 90000 (H.264 clock rate)
-        let mut sample_builder = SampleBuilder::new(512, H264Packet::default(), 90000);
+        // max_late: 64 (balanced for low latency without packet loss), sample_rate: 90000 (H.264 clock rate)
+        let mut sample_builder = SampleBuilder::new(64, H264Packet::default(), 90000);
 
         tracing::info!("Starting video receive loop for track: {}", track.id());
 

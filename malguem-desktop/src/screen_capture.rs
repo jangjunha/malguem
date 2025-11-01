@@ -1,5 +1,8 @@
 use bytes::Bytes;
-use openh264::encoder::Encoder;
+use openh264::OpenH264API;
+use openh264::encoder::{
+    BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
+};
 use openh264::formats::YUVBuffer;
 use scap::capturer::{Capturer, Options};
 use scap::frame::Frame;
@@ -52,7 +55,8 @@ impl ScreenCapture {
         ));
 
         // Create channels for frame processing and control
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<FrameData>();
+        // Use bounded channel with capacity 1 to prevent frame accumulation
+        let (frame_tx, mut frame_rx) = mpsc::channel::<FrameData>(1);
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
 
         // Spawn capture task in a blocking thread (scap is synchronous)
@@ -78,7 +82,7 @@ impl ScreenCapture {
 
     /// Screen capture task (runs in blocking thread)
     fn capture_task(
-        frame_tx: mpsc::UnboundedSender<FrameData>,
+        frame_tx: mpsc::Sender<FrameData>,
         stop_tx: mpsc::UnboundedSender<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("capture_task()");
@@ -88,7 +92,7 @@ impl ScreenCapture {
             fps: 30,
             target: None, // None captures the primary display
             output_type: scap::frame::FrameType::BGRAFrame,
-            // output_resolution: scap::capturer::Resolution::_720p,
+            output_resolution: scap::capturer::Resolution::_1080p,
             show_cursor: true,
             show_highlight: false,
             ..Default::default()
@@ -169,9 +173,16 @@ impl ScreenCapture {
                         }
                     };
 
-                    if frame_tx.send(frame_data).is_err() {
-                        tracing::warn!("Failed to send frame, receiver dropped");
-                        break;
+                    // Use try_send to drop frame if channel is full (keeps latency low)
+                    match frame_tx.try_send(frame_data) {
+                        Ok(_) => {},
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Channel full - skip this frame to avoid latency buildup
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::warn!("Failed to send frame, receiver dropped");
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -192,7 +203,7 @@ impl ScreenCapture {
     /// Frame processing task that encodes and sends video frames
     async fn frame_processing_task(
         track: Arc<TrackLocalStaticSample>,
-        frame_rx: &mut mpsc::UnboundedReceiver<FrameData>,
+        frame_rx: &mut mpsc::Receiver<FrameData>,
         stop_rx: &mut mpsc::UnboundedReceiver<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // H.264 encoder (created on first frame)
@@ -206,7 +217,17 @@ impl ScreenCapture {
                     // Create encoder on first frame (encoder auto-reinitializes on resolution change)
                     if encoder.is_none() {
                         tracing::info!("Initializing H.264 encoder");
-                        encoder = Some(Encoder::new()?);
+                        encoder = Some(Encoder::with_api_config(
+                            OpenH264API::from_source(),
+                            EncoderConfig::new()
+                                .usage_type(UsageType::ScreenContentRealTime)  // TODO: 게임용이면 Camera 모드 고려
+                                .bitrate(BitRate::from_bps(3_000_000)) // FHD는 3-5Mbps, 4K는 8-12Mbps 권장
+                                .max_frame_rate(FrameRate::from_hz(30.0))
+                                .rate_control_mode(RateControlMode::Bitrate)
+                                // .background_detection(false)
+                                // .complexity(Complexity::Medium)
+                                .intra_frame_period(IntraFramePeriod::from_num_frames(60))
+                        )?);
                     }
 
                     if let Some(ref mut enc) = encoder {
