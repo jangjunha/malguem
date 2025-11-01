@@ -1,23 +1,27 @@
-use interceptor::registry::Registry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::Duration;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
-use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
+use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use malguem_lib::{ChannelID, ChatServiceClient, UserID};
+
+use crate::video_playback::VideoPlayback;
 
 /// Represents a single peer connection to another user in an RTC session
 pub struct PeerConnection {
@@ -35,22 +39,19 @@ impl PeerConnection {
         channel_id: ChannelID,
         ice_candidate_tx: mpsc::UnboundedSender<(UserID, RTCIceCandidate)>,
         runtime: Arc<tokio::runtime::Runtime>,
+        video_playback_tx: mpsc::UnboundedSender<Arc<VideoPlayback>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Create a MediaEngine
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
 
-        // Create an InterceptorRegistry
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media_engine)?;
 
-        // Create the API object with the MediaEngine
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
             .build();
 
-        // Configure ICE servers (Cloudflare STUN)
         let config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
                 urls: vec!["stun:stun.cloudflare.com:3478".to_string()],
@@ -62,13 +63,27 @@ impl PeerConnection {
         // Create a new RTCPeerConnection
         let peer_conn = Arc::new(api.new_peer_connection(config).await?);
 
-        // Allow us to receive 1 audio track, and 1 video track
-        peer_conn
-            .add_transceiver_from_kind(RTPCodecType::Audio, None)
-            .await?;
-        peer_conn
-            .add_transceiver_from_kind(RTPCodecType::Video, None)
-            .await?;
+        // peer_conn
+        //     .add_transceiver_from_kind(
+        //         RTPCodecType::Audio,
+        //         Some(RTCRtpTransceiverInit {
+        //             direction: RTCRtpTransceiverDirection::Recvonly,
+        //             send_encodings: vec![],
+        //         }),
+        //     )
+        //     .await?;
+        // peer_conn
+        //     .add_transceiver_from_kind(
+        //         RTPCodecType::Video,
+        //         Some(RTCRtpTransceiverInit {
+        //             direction: RTCRtpTransceiverDirection::Recvonly,
+        //             send_encodings: vec![],
+        //         }),
+        //         // None,
+        //     )
+        //     .await?;
+
+        // PoC에서는 여기서 audio track을 추가하기는 함
 
         // Set up ICE candidate handler
         let ice_tx = ice_candidate_tx.clone();
@@ -96,6 +111,7 @@ impl PeerConnection {
             let runtime_for_track = Arc::clone(&runtime);
             let peer_user_id_for_track = user_id.clone();
             let pc = Arc::downgrade(&peer_conn);
+            let video_playback_tx_clone = video_playback_tx.clone();
             peer_conn.on_track(Box::new(move |track, _, _| {
                 let media_ssrc = track.ssrc();
                 tracing::info!("===== RECEIVED REMOTE TRACK =====");
@@ -133,6 +149,7 @@ impl PeerConnection {
 
                 let track_clone = Arc::clone(&track);
                 let runtime_clone = Arc::clone(&runtime_for_track);
+                let video_tx = video_playback_tx_clone.clone();
                 Box::pin(async move {
                     if track.kind() == RTPCodecType::Audio {
                         // Start audio playback for this track
@@ -153,24 +170,22 @@ impl PeerConnection {
                     } else if track.kind() == RTPCodecType::Video {
                         // Start video playback for this track
                         let user_id_for_video = peer_user_id_for_track.clone();
-                        std::thread::spawn(move || {
-                            use crate::video_playback::VideoPlayback;
-                            match VideoPlayback::start(
-                                user_id_for_video,
-                                track_clone,
-                                runtime_clone,
-                            ) {
-                                Ok(playback) => {
-                                    tracing::info!("Video playback started");
-                                    // Keep playback alive by keeping it in scope
-                                    std::thread::park();
-                                    drop(playback);
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to start video playback: {}", e);
+                        match VideoPlayback::start(user_id_for_video, track_clone, runtime_clone) {
+                            Ok(playback) => {
+                                tracing::info!("Video playback started successfully");
+                                let playback = Arc::new(playback);
+                                // Send the playback to the main app
+                                if let Err(e) = video_tx.send(Arc::clone(&playback)) {
+                                    tracing::error!(
+                                        "Failed to send video playback to main app: {}",
+                                        e
+                                    );
                                 }
                             }
-                        });
+                            Err(e) => {
+                                tracing::error!("Failed to start video playback: {}", e);
+                            }
+                        }
                     }
                 })
             }));
@@ -183,44 +198,6 @@ impl PeerConnection {
             pending_ice_candidates: Arc::new(Mutex::new(Vec::new())),
             runtime,
         })
-    }
-
-    /// Add a transceiver for audio (creates an m-line in SDP)
-    pub async fn add_audio_transceiver(&self) -> Result<(), Box<dyn std::error::Error>> {
-        use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
-        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
-        use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
-
-        // Add a recvonly audio transceiver to ensure we have an m=audio line in the SDP
-        let init = RTCRtpTransceiverInit {
-            direction: RTCRtpTransceiverDirection::Recvonly,
-            send_encodings: vec![],
-        };
-
-        self.peer_conn
-            .add_transceiver_from_kind(RTPCodecType::Audio, Some(init))
-            .await?;
-
-        Ok(())
-    }
-
-    /// Add a transceiver for video (creates an m-line in SDP)
-    pub async fn add_video_transceiver(&self) -> Result<(), Box<dyn std::error::Error>> {
-        use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
-        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
-        use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
-
-        // Add a recvonly video transceiver to ensure we have an m=video line in the SDP
-        let init = RTCRtpTransceiverInit {
-            direction: RTCRtpTransceiverDirection::Recvonly,
-            send_encodings: vec![],
-        };
-
-        self.peer_conn
-            .add_transceiver_from_kind(RTPCodecType::Video, Some(init))
-            .await?;
-
-        Ok(())
     }
 
     /// Create an offer for this peer connection
@@ -312,11 +289,11 @@ impl PeerConnection {
         // Read incoming RTCP packets
         // Before these packets are returned they are processed by interceptors. For things
         // like NACK this needs to be called.
-        self.runtime.spawn(async move {
-            let mut rtcp_buf = vec![0u8; 1500];
-            while let Ok((_, _)) = sender.read(&mut rtcp_buf).await {}
-            Result::<(), ()>::Ok(())
-        });
+        // self.runtime.spawn(async move {
+        //     let mut rtcp_buf = vec![0u8; 1500];
+        //     while let Ok((_, _)) = sender.read(&mut rtcp_buf).await {}
+        //     Result::<(), ()>::Ok(())
+        // });
 
         Ok(())
     }
@@ -340,6 +317,7 @@ pub struct RTCSessionManager {
     runtime: Arc<tokio::runtime::Runtime>,
     local_audio_track: Option<Arc<TrackLocalStaticSample>>,
     local_screen_track: Arc<Mutex<Option<Arc<TrackLocalStaticSample>>>>,
+    video_playback_tx: mpsc::UnboundedSender<Arc<VideoPlayback>>,
 }
 
 impl RTCSessionManager {
@@ -351,6 +329,7 @@ impl RTCSessionManager {
         firebase_token: String,
         runtime: Arc<tokio::runtime::Runtime>,
         local_audio_track: Option<Arc<TrackLocalStaticSample>>,
+        video_playback_tx: mpsc::UnboundedSender<Arc<VideoPlayback>>,
     ) -> Self {
         let (ice_candidate_tx, ice_candidate_rx) = mpsc::unbounded_channel();
 
@@ -364,7 +343,20 @@ impl RTCSessionManager {
             ice_candidate_rx: Arc::new(Mutex::new(ice_candidate_rx)),
             runtime,
             local_audio_track,
-            local_screen_track: Arc::new(Mutex::new(None)),
+            local_screen_track: Arc::new(Mutex::new(Some(Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_H264.to_string(),
+                    clock_rate: 90000,
+                    // sdp_fmtp_line:
+                    //     "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                    //         .to_string(),
+                    ..Default::default()
+                },
+                "video".to_string(),
+                "webrtc-rs".to_string(),
+            ))))),
+            // local_screen_track: Arc::new(Mutex::new(None)),
+            video_playback_tx,
         }
     }
 
@@ -440,6 +432,7 @@ impl RTCSessionManager {
                 self.channel_id.clone(),
                 self.ice_candidate_tx.clone(),
                 Arc::clone(&self.runtime),
+                self.video_playback_tx.clone(),
             )
             .await?,
         );
@@ -465,7 +458,7 @@ impl RTCSessionManager {
         // Create and send offer
         let offer = peer.create_offer().await?;
 
-        tracing::info!("Sending offer to user {}", user_id);
+        tracing::info!("Sending offer to user {} with sdp {}", user_id, offer.sdp);
         self.rpc_client
             .offer_rtc_connection(
                 tarpc::context::current(),
@@ -518,6 +511,7 @@ impl RTCSessionManager {
                         self.channel_id.clone(),
                         self.ice_candidate_tx.clone(),
                         Arc::clone(&self.runtime),
+                        self.video_playback_tx.clone(),
                     )
                     .await?,
                 );

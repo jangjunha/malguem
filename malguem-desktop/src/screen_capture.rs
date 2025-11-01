@@ -2,14 +2,15 @@ use bytes::Bytes;
 use openh264::encoder::Encoder;
 use openh264::formats::YUVBuffer;
 use scap::capturer::{Capturer, Options};
+use scap::frame::Frame;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::SystemTime;
 use tokio::sync::mpsc;
 use webrtc::api::media_engine::MIME_TYPE_H264;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use yuv::{
-    YuvChromaSubsampling, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
+    BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
     bgra_to_yuv420,
 };
 
@@ -17,18 +18,17 @@ const TARGET_FPS: u32 = 30;
 const FRAME_INTERVAL_MS: u64 = 1000 / TARGET_FPS as u64;
 const H264_CLOCK_RATE: u32 = 90000;
 
-struct FrameData {
-    data: Vec<u8>,
-    width: u32,
-    height: u32,
+pub struct FrameData {
+    pub data: YUVBuffer,
+    pub timestamp: SystemTime,
 }
+
 pub struct ScreenCapture {
     stop_tx: mpsc::UnboundedSender<()>,
     track: Arc<TrackLocalStaticSample>,
 }
 
 impl ScreenCapture {
-    /// Start capturing screen
     pub fn start(
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -41,14 +41,10 @@ impl ScreenCapture {
             tracing::info!("Screen capture permission granted");
         }
 
-        // Create WebRTC video track for H.264
         let track = Arc::new(TrackLocalStaticSample::new(
             webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_H264.to_string(),
                 clock_rate: H264_CLOCK_RATE,
-                // sdp_fmtp_line:
-                //     "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                //         .to_string(),
                 ..Default::default()
             },
             "video".to_string(),
@@ -85,13 +81,14 @@ impl ScreenCapture {
         frame_tx: mpsc::UnboundedSender<FrameData>,
         stop_tx: mpsc::UnboundedSender<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Get the main display
-        let display = scap::get_main_display();
-        tracing::info!("Capturing main display");
+        tracing::info!("capture_task()");
 
         // Create capturer options
         let options = Options {
-            target: Some(scap::Target::Display(display)),
+            fps: 30,
+            target: None, // None captures the primary display
+            output_type: scap::frame::FrameType::BGRAFrame,
+            // output_resolution: scap::capturer::Resolution::_720p,
             show_cursor: true,
             show_highlight: false,
             ..Default::default()
@@ -112,29 +109,57 @@ impl ScreenCapture {
             // Capture a frame
             match capturer.get_next_frame() {
                 Ok(frame) => {
-                    // Extract frame data based on Frame enum variant
-                    use scap::frame::Frame;
-
-                    let (width, height, bgra_data) = match frame {
+                    let frame_data = match frame {
                         Frame::Video(video_frame) => match video_frame {
                             scap::frame::VideoFrame::BGRA(bgra_frame) => {
-                                // Access BGRA frame data
-                                (
-                                    bgra_frame.width as u32,
-                                    bgra_frame.height as u32,
-                                    bgra_frame.data.clone(),
-                                )
-                            }
-                            scap::frame::VideoFrame::BGR0(bgr_frame) => {
-                                // BGR0 format - treat as BGRA
-                                (
-                                    bgr_frame.width as u32,
-                                    bgr_frame.height as u32,
-                                    bgr_frame.data.clone(),
-                                )
+                                let yuv = {
+                                    let width = bgra_frame.width as u32;
+                                    let height = bgra_frame.height as u32;
+
+                                    // YUV420
+                                    let y_size = width * height;
+                                    let uv_size = (width / 2) * (height / 2);
+                                    let total_size = y_size + uv_size * 2;
+
+                                    let mut yuv_data = vec![0u8; total_size as usize];
+
+                                    // YUV 버퍼를 Y, U, V 평면으로 분리
+                                    let (y_plane, rest) = yuv_data.split_at_mut(y_size as usize);
+                                    let (u_plane, v_plane) = rest.split_at_mut(uv_size as usize);
+
+                                    let mut planar_image = YuvPlanarImageMut {
+                                        y_plane: BufferStoreMut::Borrowed(y_plane),
+                                        y_stride: width,
+                                        u_plane: BufferStoreMut::Borrowed(u_plane),
+                                        u_stride: width / 2,
+                                        v_plane: BufferStoreMut::Borrowed(v_plane),
+                                        v_stride: width / 2,
+                                        width,
+                                        height,
+                                    };
+                                    let bgra_stride = width * 4;
+
+                                    bgra_to_yuv420(
+                                        &mut planar_image,
+                                        &bgra_frame.data,
+                                        bgra_stride,
+                                        YuvRange::Limited,
+                                        YuvStandardMatrix::Bt709,
+                                        YuvConversionMode::Fast,
+                                    )?;
+
+                                    YUVBuffer::from_vec(yuv_data, width as usize, height as usize)
+                                };
+                                FrameData {
+                                    data: yuv,
+                                    timestamp: bgra_frame.display_time,
+                                }
                             }
                             _ => {
-                                tracing::warn!("Unsupported video frame format");
+                                tracing::warn!(
+                                    "Unsupported video frame format (expected YUV): {:?}",
+                                    video_frame
+                                );
                                 continue;
                             }
                         },
@@ -142,13 +167,6 @@ impl ScreenCapture {
                             tracing::warn!("Received audio frame instead of video");
                             continue;
                         }
-                    };
-
-                    // Send frame data for encoding
-                    let frame_data = FrameData {
-                        data: bgra_data,
-                        width,
-                        height,
                     };
 
                     if frame_tx.send(frame_data).is_err() {
@@ -179,8 +197,8 @@ impl ScreenCapture {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // H.264 encoder (created on first frame)
         let mut encoder: Option<Encoder> = None;
-        let mut current_width: u32 = 0;
-        let mut current_height: u32 = 0;
+        // let mut current_width: u32 = 0;
+        // let mut current_height: u32 = 0;
 
         loop {
             tokio::select! {
@@ -192,35 +210,19 @@ impl ScreenCapture {
                     }
 
                     if let Some(ref mut enc) = encoder {
-                        // Track dimension changes
-                        if frame_data.width != current_width || frame_data.height != current_height {
-                            tracing::info!("Encoding {}x{} frames", frame_data.width, frame_data.height);
-                            current_width = frame_data.width;
-                            current_height = frame_data.height;
-                        }
+                        let yuv = frame_data.data;
 
-                        // Convert BGRA to YUV420
-                        let yuv = Self::bgra_to_yuv420_buffer(
-                            &frame_data.data,
-                            frame_data.width,
-                            frame_data.height
-                        )?;
+                        // Track dimension changes
+                        // if frame_data.width != current_width || frame_data.height != current_height {
+                        //     tracing::info!("Encoding {}x{} frames", frame_data.width, frame_data.height);
+                        //     current_width = frame_data.width;
+                        //     current_height = frame_data.height;
+                        // }
 
                         // Encode frame with H.264 and collect all NAL units
-                        let nal_data = match enc.encode(&yuv) {
-                            Ok(bitstream) => {
-                                // Combine all NAL units from all layers into a single buffer
-                                let mut combined = Vec::new();
-                                for i in 0..bitstream.num_layers() {
-                                    if let Some(layer) = bitstream.layer(i) {
-                                        for j in 0..layer.nal_count() {
-                                            if let Some(nal) = layer.nal_unit(j) {
-                                                combined.extend_from_slice(nal);
-                                            }
-                                        }
-                                    }
-                                }
-                                combined
+                        let bitstream = match enc.encode(&yuv) {
+                            Ok(encoded) => {
+                                encoded.to_vec()
                             }
                             Err(e) => {
                                 tracing::error!("H.264 encoding failed: {}", e);
@@ -228,15 +230,14 @@ impl ScreenCapture {
                             }
                         };
 
-                        if !nal_data.is_empty() {
-                            if let Err(e) = track.write_sample(&Sample {
-                                    data: Bytes::from(nal_data),
-                                    duration: Duration::from_millis(FRAME_INTERVAL_MS),
-                                    ..Default::default()
-                                })
-                                .await {
-                                    tracing::error!("Failed to write RTP packet: {}", e);
-                            }
+                        if let Err(e) = track.write_sample(&Sample {
+                                data: Bytes::from(bitstream),
+                                timestamp: frame_data.timestamp,
+                                // duration: Duration::from_millis(FRAME_INTERVAL_MS),
+                                ..Default::default()
+                            })
+                            .await {
+                                tracing::error!("Failed to write RTP packet: {}", e);
                         }
                     }
                 }
@@ -248,36 +249,6 @@ impl ScreenCapture {
         }
 
         Ok(())
-    }
-
-    fn bgra_to_yuv420_buffer(
-        bgra: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<YUVBuffer, Box<dyn std::error::Error>> {
-        let yuv_image = {
-            let mut yuv_image =
-                YuvPlanarImageMut::alloc(width, height, YuvChromaSubsampling::Yuv420);
-            bgra_to_yuv420(
-                &mut yuv_image,
-                bgra,
-                width,
-                YuvRange::Limited,
-                YuvStandardMatrix::Bt601,
-                YuvConversionMode::default(),
-            )?;
-            yuv_image
-        };
-        Ok(YUVBuffer::from_vec(
-            [
-                yuv_image.y_plane.borrow(),
-                yuv_image.u_plane.borrow(),
-                yuv_image.v_plane.borrow(),
-            ]
-            .concat(),
-            width as usize,
-            height as usize,
-        ))
     }
 
     /// Get the video track for adding to peer connections

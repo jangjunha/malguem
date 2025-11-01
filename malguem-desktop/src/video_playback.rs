@@ -4,15 +4,15 @@ use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use webrtc::media::io::sample_builder::SampleBuilder;
+use webrtc::rtp::codecs::h264::H264Packet;
 use webrtc::track::track_remote::TrackRemote;
 use yuv::{YuvPlanarImage, YuvRange, YuvStandardMatrix};
 
 /// Represents a video playback session for a remote video track
 pub struct VideoPlayback {
-    #[allow(dead_code)]
-    user_id: UserID,
-    #[allow(dead_code)]
-    frame_buffer: Arc<Mutex<Option<VideoFrame>>>,
+    pub user_id: UserID,
+    pub frame_buffer: Arc<Mutex<Option<VideoFrame>>>,
 }
 
 /// A decoded video frame ready for display
@@ -43,13 +43,6 @@ impl VideoPlayback {
             }
         });
 
-        // Create a separate window for this video stream
-        let frame_buffer_for_window = Arc::clone(&frame_buffer);
-        let user_id_for_window = user_id;
-        std::thread::spawn(move || {
-            Self::video_window_task(user_id_for_window, frame_buffer_for_window);
-        });
-
         Ok(Self {
             user_id,
             frame_buffer,
@@ -64,10 +57,11 @@ impl VideoPlayback {
         // Create H.264 decoder
         let mut decoder = Decoder::new()?;
 
-        tracing::info!("Starting video receive loop for track: {}", track.id());
+        // Create SampleBuilder with H264Packet depacketizer
+        // max_late: 512, sample_rate: 90000 (H.264 clock rate)
+        let mut sample_builder = SampleBuilder::new(512, H264Packet::default(), 90000);
 
-        // Buffer to accumulate RTP payload data for a complete frame
-        let mut nal_buffer = Vec::new();
+        tracing::info!("Starting video receive loop for track: {}", track.id());
 
         loop {
             // Read RTP packet
@@ -79,54 +73,16 @@ impl VideoPlayback {
                 }
             };
 
-            // H.264 RTP payload processing
-            // The payload contains NAL units (may be fragmented via FU-A)
-            let payload = &rtp_packet.payload;
+            // Push RTP packet into SampleBuilder
+            sample_builder.push(rtp_packet);
 
-            if payload.is_empty() {
-                continue;
-            }
-
-            // Check NAL unit type (first 5 bits of first byte)
-            let nal_type = payload[0] & 0x1F;
-
-            if nal_type == 28 {
-                // FU-A fragmentation unit
-                if payload.len() < 2 {
-                    continue;
-                }
-
-                let fu_header = payload[1];
-                let start_bit = (fu_header & 0x80) != 0;
-                let end_bit = (fu_header & 0x40) != 0;
-                let fragment_type = fu_header & 0x1F;
-
-                if start_bit {
-                    // Start of fragmented NAL unit
-                    nal_buffer.clear();
-                    // Reconstruct NAL header
-                    let nal_header = (payload[0] & 0xE0) | fragment_type;
-                    nal_buffer.push(nal_header);
-                    nal_buffer.extend_from_slice(&payload[2..]);
-                } else {
-                    // Continuation or end of fragmented NAL unit
-                    nal_buffer.extend_from_slice(&payload[2..]);
-                }
-
-                if end_bit {
-                    // Complete NAL unit assembled, decode it
-                    if let Err(e) =
-                        Self::decode_and_display(&mut decoder, &nal_buffer, &frame_buffer).await
-                    {
-                        tracing::debug!("Failed to decode NAL unit: {}", e);
-                    }
-                    nal_buffer.clear();
-                }
-            } else {
-                // Single NAL unit (not fragmented)
-                if let Err(e) = Self::decode_and_display(&mut decoder, payload, &frame_buffer).await
+            // Pop completed samples
+            while let Some(sample) = sample_builder.pop() {
+                let bitstream: &[u8] = &sample.data;
+                if let Err(e) =
+                    Self::decode_and_display(&mut decoder, bitstream, &frame_buffer).await
                 {
-                    tracing::debug!("Failed to decode NAL unit: {}", e);
+                    tracing::debug!("Failed to decode: {}", e);
                 }
             }
         }
@@ -138,11 +94,11 @@ impl VideoPlayback {
     /// Decode a NAL unit and update the frame buffer
     async fn decode_and_display(
         decoder: &mut Decoder,
-        nal_data: &[u8],
+        bitstream: &[u8],
         frame_buffer: &Arc<Mutex<Option<VideoFrame>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Decode the NAL unit
-        let yuv = decoder.decode(nal_data)?;
+        let yuv = decoder.decode(bitstream)?;
 
         if let Some(yuv_frame) = yuv {
             // Get dimensions
@@ -150,14 +106,14 @@ impl VideoPlayback {
             let width = width as u32;
             let height = height as u32;
 
-            // Convert YUV420 to BGRA for display
-            let bgra_data = Self::yuv420_to_bgra(&yuv_frame, width, height)?;
+            // Convert YUV420 to RGBA for display
+            let rgba_data = Self::yuv420_to_rgba(&yuv_frame, width, height)?;
 
             // Update frame buffer
             let frame = VideoFrame {
                 width,
                 height,
-                rgba_data: bgra_data,
+                rgba_data,
             };
 
             let mut buffer = frame_buffer.lock().await;
@@ -167,8 +123,8 @@ impl VideoPlayback {
         Ok(())
     }
 
-    /// Convert YUV420 to BGRA
-    fn yuv420_to_bgra(
+    /// Convert YUV420 to RGBA
+    fn yuv420_to_rgba(
         yuv_frame: &impl openh264::formats::YUVSource,
         width: u32,
         height: u32,
@@ -176,7 +132,6 @@ impl VideoPlayback {
         let width_usize = width as usize;
         let height_usize = height as usize;
 
-        // Create YUV planar image from openh264 output
         let (y_stride, u_stride, v_stride) = yuv_frame.strides();
         let yuv_image = YuvPlanarImage {
             y_plane: yuv_frame.y(),
@@ -185,74 +140,59 @@ impl VideoPlayback {
             u_stride: u_stride as u32,
             v_plane: yuv_frame.v(),
             v_stride: v_stride as u32,
-            width: width,
-            height: height,
+            width,
+            height,
         };
 
-        // Allocate BGRA buffer
-        let bgra_size = width_usize * height_usize * 4;
-        let mut bgra_data = vec![0u8; bgra_size];
+        // Allocate RGBA buffer
+        let rgba_size = width_usize * height_usize * 4;
+        let mut rgba_data = vec![0u8; rgba_size];
 
-        // Convert YUV420 to BGRA
-        yuv::yuv420_to_bgra(
+        // Convert YUV420 to RGBA
+        yuv::yuv420_to_rgba(
             &yuv_image,
-            &mut bgra_data,
-            (width_usize * 4) as u32, // BGRA stride is width * 4 bytes per pixel
+            &mut rgba_data,
+            (width_usize * 4) as u32, // RGBA stride is width * 4 bytes per pixel
             YuvRange::Limited,
-            YuvStandardMatrix::Bt601,
+            YuvStandardMatrix::Bt709,
         )?;
 
-        Ok(bgra_data)
+        Ok(rgba_data)
     }
 
-    /// Create and run a video display window
-    fn video_window_task(user_id: UserID, frame_buffer: Arc<Mutex<Option<VideoFrame>>>) {
-        let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_title(format!("Video - User {}", user_id))
-                .with_inner_size([640.0, 480.0]),
-            ..Default::default()
-        };
+    /// Render video in an egui::Window
+    /// Call this from the main UI loop
+    pub fn render_window(&self, ctx: &egui::Context) {
+        egui::Window::new(format!("Video - User {}", self.user_id))
+            .default_size([640.0, 480.0])
+            .show(ctx, |ui| {
+                // Try to get the latest frame
+                if let Ok(buffer) = self.frame_buffer.try_lock() {
+                    if let Some(ref video_frame) = *buffer {
+                        // Create a color image from RGBA data
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                            [video_frame.width as usize, video_frame.height as usize],
+                            &video_frame.rgba_data,
+                        );
 
-        let _ = eframe::run_simple_native(
-            &format!("Video - User {}", user_id),
-            options,
-            move |ctx, _frame| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    // Try to get the latest frame
-                    if let Ok(buffer) = frame_buffer.try_lock() {
-                        if let Some(ref video_frame) = *buffer {
-                            // Create a color image from BGRA data
-                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                [video_frame.width as usize, video_frame.height as usize],
-                                &video_frame.rgba_data,
-                            );
+                        let texture = ctx.load_texture(
+                            format!("video_frame_{}", self.user_id),
+                            color_image,
+                            egui::TextureOptions::default(),
+                        );
 
-                            let texture = ctx.load_texture(
-                                "video_frame",
-                                color_image,
-                                egui::TextureOptions::default(),
-                            );
-
-                            // Display the video frame
-                            ui.image(&texture);
-                        } else {
-                            ui.centered_and_justified(|ui| {
-                                ui.label("Waiting for video...");
-                            });
-                        }
+                        // Display the video frame
+                        ui.image(&texture);
                     } else {
                         ui.centered_and_justified(|ui| {
-                            ui.label("Loading...");
+                            ui.label("Waiting for video...");
                         });
                     }
-                });
-
-                // Request continuous repaints for smooth video playback
-                ctx.request_repaint();
-            },
-        );
-
-        tracing::info!("Video window closed for user: {}", user_id);
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Loading...");
+                    });
+                }
+            });
     }
 }

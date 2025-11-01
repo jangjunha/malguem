@@ -1,5 +1,8 @@
 use eframe::egui;
-use malguem_lib::{Channel, ChannelID, ChannelType, ChatServiceClient, Event, Message, User};
+use malguem_lib::{
+    Channel, ChannelID, ChannelType, ChatServiceClient, Event, Message, User, UserID,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -10,6 +13,7 @@ use crate::audio_capture::AudioCapture;
 use crate::connection::Connection;
 use crate::rtc::RTCSessionManager;
 use crate::screen_capture::ScreenCapture;
+use crate::video_playback::VideoPlayback;
 
 mod audio_capture;
 mod audio_playback;
@@ -38,6 +42,7 @@ struct CurrentRTCSession {
     #[allow(dead_code)]
     audio_capture: Option<AudioCapture>,
     screen_capture: Option<ScreenCapture>,
+    video_playbacks: HashMap<UserID, Arc<VideoPlayback>>,
 }
 
 impl CurrentRTCSession {
@@ -51,6 +56,7 @@ impl CurrentRTCSession {
             manager,
             audio_capture,
             screen_capture: None,
+            video_playbacks: HashMap::new(),
         }
     }
 }
@@ -91,11 +97,16 @@ struct App {
     runtime: Arc<tokio::runtime::Runtime>,
     rpc: Option<ChatServiceClient>,
     event_rx: Option<mpsc::UnboundedReceiver<Event>>,
+
+    // Video playback
+    video_playback_tx: mpsc::UnboundedSender<Arc<VideoPlayback>>,
+    video_playback_rx: mpsc::UnboundedReceiver<Arc<VideoPlayback>>,
 }
 
 impl Default for App {
     fn default() -> Self {
         let firebase_auth = FirebaseAuth::new();
+        let (video_playback_tx, video_playback_rx) = mpsc::unbounded_channel();
 
         Self {
             connected: false,
@@ -121,6 +132,8 @@ impl Default for App {
             ),
             rpc: None,
             event_rx: None,
+            video_playback_tx,
+            video_playback_rx,
         }
     }
 }
@@ -259,7 +272,7 @@ impl App {
                             }
                         };
 
-                    // Create RTCSessionManager with audio track
+                    // Create RTCSessionManager with audio track and video playback channel
                     let manager = Arc::new(RTCSessionManager::new(
                         channel_id.clone(),
                         current_user_id,
@@ -267,6 +280,7 @@ impl App {
                         firebase_token_for_manager,
                         self.runtime.clone(),
                         audio_track,
+                        self.video_playback_tx.clone(),
                     ));
 
                     // Start ICE candidate sender task
@@ -715,6 +729,18 @@ impl App {
         }
     }
 
+    fn check_video_playbacks(&mut self) {
+        // Collect new video playbacks from the channel
+        while let Ok(playback) = self.video_playback_rx.try_recv() {
+            if let Some(session) = &mut self.current_rtc_session {
+                tracing::info!("Adding video playback for user {}", playback.user_id);
+                session
+                    .video_playbacks
+                    .insert(playback.user_id.clone(), playback);
+            }
+        }
+    }
+
     fn handle_event(&mut self, event: Event) {
         use malguem_lib::{Event, RTCSessionEvent};
 
@@ -852,6 +878,9 @@ impl eframe::App for App {
         // Check for server events
         self.check_events();
 
+        // Check for new video playbacks
+        self.check_video_playbacks();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.connected {
                 self.render_login_screen(ui);
@@ -859,6 +888,13 @@ impl eframe::App for App {
                 self.render_main_screen(ui);
             }
         });
+
+        // Render video playback windows
+        if let Some(session) = &self.current_rtc_session {
+            for playback in session.video_playbacks.values() {
+                playback.render_window(ctx);
+            }
+        }
 
         // Request repaint if waiting for OAuth (to check callback)
         if self.oauth_receiver.is_some() {
@@ -873,12 +909,14 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_level(true)
-        .with_writer(std::io::stdout)
-        .init();
+    env_logger::init();
+
+    // tracing_subscriber::fmt()
+    //     .with_target(false)
+    //     .with_thread_ids(false)
+    //     .with_level(true)
+    //     .with_writer(std::io::stdout)
+    //     .init();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
