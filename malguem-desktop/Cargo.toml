@@ -42,10 +42,10 @@ cpal = "0.15"
 opus = "0.3"
 rand = "0.8"
 scap = "0.1.0-beta.1"
-openh264 = "0.9"
 bytes = "1"
 yuv = { version = "0.8.8", features = [
     "fast_mode",
 ] } # TODO: check On aarch64 i8mm activated feature may be preferred, nightly compiler channel is required, when encoding RGBA/BGRA only. For x86 consider activating avx512 feature ( nightly compiler channel is required ), it may significantly increase throughout on some modern CPU’s, even without AVX-512 available. avxvnni may be used instead.
 log = "0.4"
 env_logger = "0.10"
+ac-ffmpeg = "0.19.0"

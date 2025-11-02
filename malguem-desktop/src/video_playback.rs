@@ -1,7 +1,8 @@
+use ac_ffmpeg::codec::Decoder;
+use ac_ffmpeg::codec::video::VideoDecoder;
+use ac_ffmpeg::packet::PacketMut;
 use eframe::egui;
 use malguem_lib::UserID;
-use openh264::decoder::Decoder;
-use openh264::formats::YUVSource;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use webrtc::media::io::sample_builder::SampleBuilder;
@@ -55,10 +56,10 @@ impl VideoPlayback {
         frame_buffer: Arc<Mutex<Option<VideoFrame>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Create H.264 decoder
-        let mut decoder = Decoder::new()?;
+        let mut decoder = VideoDecoder::new("h264")?;
 
         // Create SampleBuilder with H264Packet depacketizer
-        // max_late: 64 (balanced for low latency without packet loss), sample_rate: 90000 (H.264 clock rate)
+        // max_late: 80 (balanced for 1080p I-frames without excessive buffering), sample_rate: 90000 (H.264 clock rate)
         let mut sample_builder = SampleBuilder::new(64, H264Packet::default(), 90000);
 
         tracing::info!("Starting video receive loop for track: {}", track.id());
@@ -78,9 +79,22 @@ impl VideoPlayback {
 
             // Pop completed samples
             while let Some(sample) = sample_builder.pop() {
-                let bitstream: &[u8] = &sample.data;
-                if let Err(e) =
-                    Self::decode_and_display(&mut decoder, bitstream, &frame_buffer).await
+                let receive_time = std::time::SystemTime::now();
+                let sample_size = sample.data.len();
+
+                tracing::info!(
+                    "[LATENCY] Sample popped from builder, size: {} bytes, received at: {:?}",
+                    sample_size,
+                    receive_time
+                );
+
+                if let Err(e) = Self::decode_and_display(
+                    &mut decoder,
+                    &sample.data,
+                    &frame_buffer,
+                    receive_time,
+                )
+                .await
                 {
                     tracing::debug!("Failed to decode: {}", e);
                 }
@@ -93,53 +107,86 @@ impl VideoPlayback {
 
     /// Decode a NAL unit and update the frame buffer
     async fn decode_and_display(
-        decoder: &mut Decoder,
+        decoder: &mut VideoDecoder,
         bitstream: &[u8],
         frame_buffer: &Arc<Mutex<Option<VideoFrame>>>,
+        t0: std::time::SystemTime,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Decode the NAL unit
-        let yuv = decoder.decode(bitstream)?;
+        // Create packet from bitstream
+        let mut packet_mut = PacketMut::new(bitstream.len());
+        packet_mut.data_mut().copy_from_slice(bitstream);
+        let packet = packet_mut.freeze();
 
-        if let Some(yuv_frame) = yuv {
+        // Push packet to decoder
+        decoder.push(packet)?;
+
+        // Try to get decoded frames
+        while let Some(frame) = decoder.take()? {
+            let decoding_ms = t0.elapsed().unwrap().as_millis();
+            tracing::info!("[LATENCY] H.264 decoding: {}ms", decoding_ms);
+
+            let t1 = std::time::SystemTime::now();
+
             // Get dimensions
-            let (width, height) = yuv_frame.dimensions();
-            let width = width as u32;
-            let height = height as u32;
+            let width = frame.width() as u32;
+            let height = frame.height() as u32;
 
             // Convert YUV420 to RGBA for display
-            let rgba_data = Self::yuv420_to_rgba(&yuv_frame, width, height)?;
+            let rgba_data = Self::yuv420_to_rgba_ffmpeg(&frame, width, height)?;
+
+            let rgba_conversion_ms = t1.elapsed().unwrap().as_millis();
+            tracing::info!("[LATENCY] RGBA conversion: {}ms", rgba_conversion_ms);
 
             // Update frame buffer
-            let frame = VideoFrame {
+            let video_frame = VideoFrame {
                 width,
                 height,
                 rgba_data,
             };
 
+            let t2 = std::time::SystemTime::now();
             let mut buffer = frame_buffer.lock().await;
-            *buffer = Some(frame);
+            *buffer = Some(video_frame);
+            let buffer_update_ms = t2.elapsed().unwrap().as_millis();
+
+            let total_ms = t0.elapsed().unwrap().as_millis();
+            tracing::info!(
+                "[LATENCY] Frame buffer update: {}ms, TOTAL receive pipeline: {}ms",
+                buffer_update_ms,
+                total_ms
+            );
         }
 
         Ok(())
     }
 
-    /// Convert YUV420 to RGBA
-    fn yuv420_to_rgba(
-        yuv_frame: &impl openh264::formats::YUVSource,
+    /// Convert YUV420 to RGBA using ac-ffmpeg frame
+    fn yuv420_to_rgba_ffmpeg(
+        yuv_frame: &ac_ffmpeg::codec::video::VideoFrame,
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let width_usize = width as usize;
         let height_usize = height as usize;
 
-        let (y_stride, u_stride, v_stride) = yuv_frame.strides();
+        let planes = yuv_frame.planes();
+
+        // Get Y, U, V plane data and strides
+        let y_plane = planes[0].data();
+        let u_plane = planes[1].data();
+        let v_plane = planes[2].data();
+
+        let y_stride = planes[0].line_size() as u32;
+        let u_stride = planes[1].line_size() as u32;
+        let v_stride = planes[2].line_size() as u32;
+
         let yuv_image = YuvPlanarImage {
-            y_plane: yuv_frame.y(),
-            y_stride: y_stride as u32,
-            u_plane: yuv_frame.u(),
-            u_stride: u_stride as u32,
-            v_plane: yuv_frame.v(),
-            v_stride: v_stride as u32,
+            y_plane,
+            y_stride,
+            u_plane,
+            u_stride,
+            v_plane,
+            v_stride,
             width,
             height,
         };

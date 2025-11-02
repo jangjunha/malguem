@@ -17,6 +17,7 @@ use crate::video_playback::VideoPlayback;
 
 mod audio_capture;
 mod audio_playback;
+mod codec;
 mod connection;
 mod rtc;
 mod screen_capture;

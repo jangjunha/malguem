@@ -1,13 +1,11 @@
+use ac_ffmpeg::codec::Encoder;
+use ac_ffmpeg::codec::video::{self, VideoEncoder, VideoFrameMut};
+use ac_ffmpeg::time::TimeBase;
 use bytes::Bytes;
-use openh264::OpenH264API;
-use openh264::encoder::{
-    BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
-};
-use openh264::formats::YUVBuffer;
 use scap::capturer::{Capturer, Options};
 use scap::frame::Frame;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use webrtc::api::media_engine::MIME_TYPE_H264;
 use webrtc::media::Sample;
@@ -17,12 +15,16 @@ use yuv::{
     bgra_to_yuv420,
 };
 
+use crate::codec::find_encoder;
+
 const TARGET_FPS: u32 = 30;
 const FRAME_INTERVAL_MS: u64 = 1000 / TARGET_FPS as u64;
 const H264_CLOCK_RATE: u32 = 90000;
 
 pub struct FrameData {
-    pub data: YUVBuffer,
+    pub yuv_data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
     pub timestamp: SystemTime,
 }
 
@@ -55,7 +57,7 @@ impl ScreenCapture {
         ));
 
         // Create channels for frame processing and control
-        // Use bounded channel with capacity 1 to prevent frame accumulation
+        // Use bounded channel with capacity 1 to minimize latency
         let (frame_tx, mut frame_rx) = mpsc::channel::<FrameData>(1);
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
 
@@ -116,47 +118,58 @@ impl ScreenCapture {
                     let frame_data = match frame {
                         Frame::Video(video_frame) => match video_frame {
                             scap::frame::VideoFrame::BGRA(bgra_frame) => {
-                                let yuv = {
-                                    let width = bgra_frame.width as u32;
-                                    let height = bgra_frame.height as u32;
+                                let capture_time = bgra_frame.display_time;
+                                tracing::info!(
+                                    "[LATENCY] capture delay: {}ms",
+                                    capture_time.elapsed().unwrap().as_millis()
+                                );
 
-                                    // YUV420
-                                    let y_size = width * height;
-                                    let uv_size = (width / 2) * (height / 2);
-                                    let total_size = y_size + uv_size * 2;
+                                let width = bgra_frame.width as u32;
+                                let height = bgra_frame.height as u32;
 
-                                    let mut yuv_data = vec![0u8; total_size as usize];
+                                // YUV420
+                                let y_size = width * height;
+                                let uv_size = (width / 2) * (height / 2);
+                                let total_size = y_size + uv_size * 2;
 
-                                    // YUV 버퍼를 Y, U, V 평면으로 분리
-                                    let (y_plane, rest) = yuv_data.split_at_mut(y_size as usize);
-                                    let (u_plane, v_plane) = rest.split_at_mut(uv_size as usize);
+                                let mut yuv_data = vec![0u8; total_size as usize];
 
-                                    let mut planar_image = YuvPlanarImageMut {
-                                        y_plane: BufferStoreMut::Borrowed(y_plane),
-                                        y_stride: width,
-                                        u_plane: BufferStoreMut::Borrowed(u_plane),
-                                        u_stride: width / 2,
-                                        v_plane: BufferStoreMut::Borrowed(v_plane),
-                                        v_stride: width / 2,
-                                        width,
-                                        height,
-                                    };
-                                    let bgra_stride = width * 4;
+                                // YUV 버퍼를 Y, U, V 평면으로 분리
+                                let (y_plane, rest) = yuv_data.split_at_mut(y_size as usize);
+                                let (u_plane, v_plane) = rest.split_at_mut(uv_size as usize);
 
-                                    bgra_to_yuv420(
-                                        &mut planar_image,
-                                        &bgra_frame.data,
-                                        bgra_stride,
-                                        YuvRange::Limited,
-                                        YuvStandardMatrix::Bt709,
-                                        YuvConversionMode::Fast,
-                                    )?;
-
-                                    YUVBuffer::from_vec(yuv_data, width as usize, height as usize)
+                                let mut planar_image = YuvPlanarImageMut {
+                                    y_plane: BufferStoreMut::Borrowed(y_plane),
+                                    y_stride: width,
+                                    u_plane: BufferStoreMut::Borrowed(u_plane),
+                                    u_stride: width / 2,
+                                    v_plane: BufferStoreMut::Borrowed(v_plane),
+                                    v_stride: width / 2,
+                                    width,
+                                    height,
                                 };
+                                let bgra_stride = width * 4;
+
+                                bgra_to_yuv420(
+                                    &mut planar_image,
+                                    &bgra_frame.data,
+                                    bgra_stride,
+                                    YuvRange::Limited,
+                                    YuvStandardMatrix::Bt709,
+                                    YuvConversionMode::Fast,
+                                )?;
+
+                                let yuv_conversion_ms = capture_time.elapsed().unwrap().as_millis();
+                                tracing::info!(
+                                    "[LATENCY] until YUV conversion: {}ms",
+                                    yuv_conversion_ms
+                                );
+
                                 FrameData {
-                                    data: yuv,
-                                    timestamp: bgra_frame.display_time,
+                                    yuv_data,
+                                    width,
+                                    height,
+                                    timestamp: capture_time,
                                 }
                             }
                             _ => {
@@ -175,7 +188,7 @@ impl ScreenCapture {
 
                     // Use try_send to drop frame if channel is full (keeps latency low)
                     match frame_tx.try_send(frame_data) {
-                        Ok(_) => {},
+                        Ok(_) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             // Channel full - skip this frame to avoid latency buildup
                         }
@@ -207,63 +220,88 @@ impl ScreenCapture {
         stop_rx: &mut mpsc::UnboundedReceiver<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // H.264 encoder (created on first frame)
-        let mut encoder: Option<Encoder> = None;
-        // let mut current_width: u32 = 0;
-        // let mut current_height: u32 = 0;
+        let mut encoder: Option<VideoEncoder> = None;
+        let mut frame_counter: i64 = 0;
 
         loop {
             tokio::select! {
                 Some(frame_data) = frame_rx.recv() => {
-                    // Create encoder on first frame (encoder auto-reinitializes on resolution change)
+                    // Create encoder on first frame
                     if encoder.is_none() {
-                        tracing::info!("Initializing H.264 encoder");
-                        encoder = Some(Encoder::with_api_config(
-                            OpenH264API::from_source(),
-                            EncoderConfig::new()
-                                .usage_type(UsageType::ScreenContentRealTime)  // TODO: 게임용이면 Camera 모드 고려
-                                .bitrate(BitRate::from_bps(3_000_000)) // FHD는 3-5Mbps, 4K는 8-12Mbps 권장
-                                .max_frame_rate(FrameRate::from_hz(30.0))
-                                .rate_control_mode(RateControlMode::Bitrate)
-                                // .background_detection(false)
-                                // .complexity(Complexity::Medium)
-                                .intra_frame_period(IntraFramePeriod::from_num_frames(60))
-                        )?);
+                        tracing::info!("Initializing H.264 encoder with ac-ffmpeg ({}x{})", frame_data.width, frame_data.height);
+                        let enc = find_encoder(frame_data.width as usize, frame_data.height as usize, TARGET_FPS)?;
+                        encoder = Some(enc);
                     }
 
                     if let Some(ref mut enc) = encoder {
-                        let yuv = frame_data.data;
+                        let t0 = std::time::SystemTime::now();
 
-                        // Track dimension changes
-                        // if frame_data.width != current_width || frame_data.height != current_height {
-                        //     tracing::info!("Encoding {}x{} frames", frame_data.width, frame_data.height);
-                        //     current_width = frame_data.width;
-                        //     current_height = frame_data.height;
-                        // }
+                        // Create a mutable video frame
+                        let pixel_format = video::frame::get_pixel_format("yuv420p");
+                        let time_base = TimeBase::new(1, TARGET_FPS as i32);
+                        let mut video_frame = VideoFrameMut::black(
+                            pixel_format,
+                            frame_data.width as usize,
+                            frame_data.height as usize
+                        );
 
-                        // Encode frame with H.264 and collect all NAL units
-                        let bitstream = match enc.encode(&yuv) {
-                            Ok(encoded) => {
-                                encoded.to_vec()
+                        // Copy YUV data into the frame
+                        // YUV420 planar format: Y plane, then U plane, then V plane
+                        let y_size = (frame_data.width * frame_data.height) as usize;
+                        let uv_size = y_size / 4;
+
+                        {
+                            let mut frame_planes = video_frame.planes_mut();
+                            frame_planes[0].data_mut()[..y_size].copy_from_slice(&frame_data.yuv_data[..y_size]);
+                            frame_planes[1].data_mut()[..uv_size].copy_from_slice(&frame_data.yuv_data[y_size..y_size + uv_size]);
+                            frame_planes[2].data_mut()[..uv_size].copy_from_slice(&frame_data.yuv_data[y_size + uv_size..]);
+                        }
+
+                        // Set presentation timestamp and freeze to immutable frame
+                        // let pts = Timestamp::new(frame_counter, time_base);
+                        // let video_frame = video_frame.freeze().with_pts(pts);
+                        // frame_counter += 1;
+                        let video_frame = video_frame.freeze();
+
+                        // Encode the frame
+                        enc.push(video_frame)?;
+
+                        // Collect encoded packets
+                        let mut bitstream = Vec::new();
+                        while let Some(packet) = enc.take()? {
+                            bitstream.extend_from_slice(packet.data());
+                        }
+
+                        let encoding_ms = t0.elapsed().unwrap().as_millis();
+                        let bitstream_size = bitstream.len();
+                        tracing::info!("[LATENCY] H.264 encoding: {}ms, size: {} bytes", encoding_ms, bitstream_size);
+
+                        if !bitstream.is_empty() {
+                            let t1 = std::time::SystemTime::now();
+                            let send_timestamp = SystemTime::now();
+                            if let Err(e) = track.write_sample(&Sample {
+                                    data: Bytes::from(bitstream),
+                                    timestamp: frame_data.timestamp,
+                                    duration: Duration::from_millis(FRAME_INTERVAL_MS),
+                                    ..Default::default()
+                                })
+                                .await {
+                                    tracing::error!("Failed to write RTP packet: {}", e);
                             }
-                            Err(e) => {
-                                tracing::error!("H.264 encoding failed: {}", e);
-                                Vec::new()
-                            }
-                        };
 
-                        if let Err(e) = track.write_sample(&Sample {
-                                data: Bytes::from(bitstream),
-                                timestamp: frame_data.timestamp,
-                                // duration: Duration::from_millis(FRAME_INTERVAL_MS),
-                                ..Default::default()
-                            })
-                            .await {
-                                tracing::error!("Failed to write RTP packet: {}", e);
+                            let write_ms = t1.elapsed().unwrap().as_millis();
+                            tracing::info!("[LATENCY] RTP write: {}ms, total: {}ms, sent at: {:?}", write_ms, frame_data.timestamp.elapsed().unwrap().as_millis(), send_timestamp);
                         }
                     }
                 }
                 Some(_) = stop_rx.recv() => {
                     tracing::info!("Stop signal received, ending frame processing");
+
+                    // Flush the encoder
+                    if let Some(ref mut enc) = encoder {
+                        let _ = enc.flush();
+                    }
+
                     break;
                 }
             }
