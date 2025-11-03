@@ -53,10 +53,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          choco install ffmpeg
+          vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows
+          echo "FFMPEG_INCLUDE_DIR=C:\vcpkg\installed\x64-windows\include" >> $env:GITHUB_ENV
+          echo "FFMPEG_LIB_DIR=C:\vcpkg\installed\x64-windows\lib" >> $env:GITHUB_ENV
+          echo "C:\vcpkg\installed\x64-windows\bin" >> $env:GITHUB_PATH
+        shell: powershell
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
