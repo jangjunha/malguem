@@ -53,10 +53,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        if: matrix.os == 'windows-latest'
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\packages
+          key: ${{ runner.os }}-vcpkg-v1-${{ hashFiles('**/vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-
+
       - name: Install FFmpeg (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows
+          vcpkg install ffmpeg[core,avcodec,avformat,swresample,nvcodec,opus,qsv,x264]:x64-windows
           echo "FFMPEG_INCLUDE_DIR=C:\vcpkg\installed\x64-windows\include" >> $env:GITHUB_ENV
           echo "FFMPEG_LIB_DIR=C:\vcpkg\installed\x64-windows\lib" >> $env:GITHUB_ENV
           echo "C:\vcpkg\installed\x64-windows\bin" >> $env:GITHUB_PATH
