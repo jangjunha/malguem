@@ -10,6 +10,8 @@
  */
 import type { Identity } from './crypto';
 import { canonicalJson, signSignal, verifySignal } from './crypto';
+import { TrackDecoder, TrackEncoder, type RelayCodecConfig } from './relay/codec';
+import { RelayHub, type HubStats, type StreamInfo } from './relay/hub';
 import type { EventSocket, ServerEvent } from './ws';
 
 export interface BroadcastSettings {
@@ -20,6 +22,15 @@ export interface BroadcastSettings {
   frameRate: number;
   /** Capture system (game) audio with the screen. */
   systemAudio: boolean;
+  /**
+   * How the screen video reaches viewers. 'webrtc': a separate encode per
+   * viewer over the mesh (upload and encoder load grow with every viewer).
+   * 'relay' (experimental): encoded once with WebCodecs and relayed viewer to
+   * viewer as encoded bytes (see lib/relay). System audio stays on the mesh.
+   */
+  transport: 'webrtc' | 'relay';
+  /** Upload this participant offers for relaying others' broadcasts, Mb/s. */
+  relayUploadMbps: number;
 }
 
 export const DEFAULT_BROADCAST: BroadcastSettings = {
@@ -28,6 +39,8 @@ export const DEFAULT_BROADCAST: BroadcastSettings = {
   height: 1080,
   frameRate: 60,
   systemAudio: true,
+  transport: 'webrtc',
+  relayUploadMbps: 20,
 };
 
 export interface PeerStats {
@@ -95,6 +108,8 @@ export interface CallCallbacks {
   /** Another participant left the call. */
   onPeerLeft: (userId: string) => void;
   onEnded: () => void;
+  /** Relay engine snapshot, once per second (relay tree, per-link state). */
+  onRelayStats?: (stats: HubStats) => void;
 }
 
 export class CallManager {
@@ -109,6 +124,13 @@ export class CallManager {
   private lastRoster = new Set<string>();
   /** Skip chimes on the very first roster (the people already present at join). */
   private rosterKnown = false;
+  /** Relayed-broadcast engine; attached to every peer connection. */
+  private relay: RelayHub | null = null;
+  private relayEncoder: TrackEncoder | null = null;
+  /** broadcasterId → decoder for the relayed stream we are watching. */
+  private relayDecoders = new Map<string, { streamId: number; dec: TrackDecoder }>();
+  /** What the mesh carries for our broadcast: the whole screen stream, or only its audio in relay mode. */
+  private meshBroadcast: MediaStream | null = null;
   settings: BroadcastSettings = { ...DEFAULT_BROADCAST };
 
   constructor(
@@ -126,6 +148,20 @@ export class CallManager {
     this.micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    this.relay = new RelayHub(
+      {
+        myId: this.myId,
+        uploadCapacityKbps: this.settings.relayUploadMbps * 1000,
+        log: (m) => console.debug('[relay]', m),
+      },
+      {
+        onStreams: (list) => this.onRelayStreams(list),
+        onFrame: (from, f) => {
+          if (!f.audio) this.relayDecoders.get(from)?.dec.decode(f);
+        },
+        onKeyframeRequest: () => this.relayEncoder?.requestKeyframe(),
+      },
+    );
     this.unsubscribe = this.socket.onEvent((ev) => this.handleEvent(ev));
     // A reconnect drops us from the server-side roster; re-join on reopen.
     this.reopenUnsub = this.socket.onOpen(() =>
@@ -142,6 +178,12 @@ export class CallManager {
     this.unsubscribe?.();
     this.reopenUnsub?.();
     if (this.statsTimer) clearInterval(this.statsTimer);
+    this.relayEncoder?.stop();
+    this.relayEncoder = null;
+    for (const { dec } of this.relayDecoders.values()) dec.close();
+    this.relayDecoders.clear();
+    this.relay?.dispose();
+    this.relay = null;
     for (const [id, peer] of this.peers) {
       peer.pc.close();
       this.cb.onRemoteStreams(id, []);
@@ -188,17 +230,56 @@ export class CallManager {
       track.onended = () => this.stopBroadcast(); // user hit the browser/OS "stop sharing"
     }
     this.screenStream = stream;
-    for (const peer of this.peers.values()) {
-      this.addStreamTracks(peer, stream);
+    this.meshBroadcast = stream;
+    if (s.transport === 'relay' && this.relay) {
+      try {
+        await this.startRelayEncoder();
+        // Only the system audio rides the mesh; video goes through the relay tree.
+        this.meshBroadcast = stream.getAudioTracks().length ? new MediaStream(stream.getAudioTracks()) : null;
+      } catch (e) {
+        // e.g. WebKit without MediaStreamTrackProcessor: fall back to the mesh.
+        console.warn('relay broadcast unavailable, using WebRTC mesh', e);
+        this.relayEncoder?.stop();
+        this.relayEncoder = null;
+      }
+    }
+    if (this.meshBroadcast) {
+      for (const peer of this.peers.values()) this.addStreamTracks(peer, this.meshBroadcast);
     }
     await this.applySenderSettings();
     this.cb.onBroadcastChanged(true);
+  }
+
+  /** (Re)start the WebCodecs encoder for the current screen and announce the stream. */
+  private async startRelayEncoder(): Promise<void> {
+    const video = this.screenStream?.getVideoTracks()[0];
+    if (!video || !this.relay) return;
+    this.relayEncoder?.stop();
+    const s = this.settings;
+    const relay = this.relay;
+    const enc = new TrackEncoder(
+      video,
+      { fps: s.frameRate, bitrateKbps: s.maxBitrateKbps, now: () => performance.timeOrigin + performance.now() },
+      (f) => relay.sendFrame(f),
+    );
+    this.relayEncoder = enc;
+    const info = await enc.start();
+    console.info('[relay] encoder', info); // which codec, hardware or not, temporal layers or not
+    relay.startBroadcast(s.maxBitrateKbps, info);
+    // Frames encoded before the announce were dropped; restart the chain.
+    enc.requestKeyframe();
   }
 
   stopBroadcast(): void {
     const stream = this.screenStream;
     if (!stream) return;
     this.screenStream = null;
+    this.meshBroadcast = null;
+    if (this.relayEncoder) {
+      this.relayEncoder.stop();
+      this.relayEncoder = null;
+      this.relay?.stopBroadcast();
+    }
     for (const peer of this.peers.values()) {
       for (const sender of peer.pc.getSenders()) {
         if (sender.track && stream.getTracks().includes(sender.track)) {
@@ -213,14 +294,26 @@ export class CallManager {
   /** Re-apply codec/bitrate/fps caps to all live senders. */
   async applySenderSettings(): Promise<void> {
     const s = this.settings;
+    this.relay?.setUploadCapacity(s.relayUploadMbps * 1000);
     const screenVideo = this.screenStream?.getVideoTracks()[0];
     if (screenVideo) {
+      const before = screenVideo.getSettings();
       await screenVideo
         .applyConstraints({
           frameRate: { ideal: s.frameRate, max: s.frameRate },
           ...(s.height > 0 ? { height: { ideal: s.height, max: s.height } } : {}),
         })
         .catch(() => {});
+      const enc = this.relayEncoder;
+      if (enc?.info) {
+        const after = screenVideo.getSettings();
+        if (after.height !== before.height || after.width !== before.width || s.frameRate !== enc.fps) {
+          await this.startRelayEncoder(); // size/rate is fixed per encoder: new stream
+        } else if (s.maxBitrateKbps !== enc.bitrateKbps) {
+          enc.setBitrate(s.maxBitrateKbps);
+          this.relay?.setBroadcastBitrate(s.maxBitrateKbps);
+        }
+      }
     }
     for (const peer of this.peers.values()) {
       for (const tr of peer.pc.getTransceivers()) {
@@ -243,9 +336,52 @@ export class CallManager {
     }
   }
 
-  /** Upload needed = per-viewer bitrate × viewers (mesh fan-out). */
+  /**
+   * Upload needed = per-viewer bitrate × viewers we feed directly: every
+   * viewer over the mesh, only our relay-tree children in relay mode.
+   */
   estimatedUploadKbps(): number {
-    return this.settings.maxBitrateKbps * Math.max(this.peers.size, 1);
+    const tree = this.relayEncoder ? this.relay?.stats().outgoing?.tree : null;
+    const direct = tree ? Object.values(tree).filter((p) => p === this.myId).length : this.peers.size;
+    return this.settings.maxBitrateKbps * Math.max(direct, 1);
+  }
+
+  /** Whether our current broadcast goes through the relay tree. */
+  get relayBroadcasting(): boolean {
+    return this.relayEncoder !== null;
+  }
+
+  private onRelayStreams(list: StreamInfo[]): void {
+    const live = new Map(list.map((s) => [s.broadcasterId, s]));
+    for (const [id, d] of this.relayDecoders) {
+      const s = live.get(id);
+      if (!s || s.streamId !== d.streamId) {
+        d.dec.close();
+        this.relayDecoders.delete(id);
+        this.emitStreams(id);
+      }
+    }
+    for (const s of list) {
+      if (s.broadcasterId === this.myId || this.relayDecoders.has(s.broadcasterId)) continue;
+      try {
+        const dec = new TrackDecoder(s.config as RelayCodecConfig, () => {});
+        this.relayDecoders.set(s.broadcasterId, { streamId: s.streamId, dec });
+      } catch (e) {
+        console.warn('cannot decode relayed stream', e);
+        continue;
+      }
+      // Everyone watches, as with the mesh today (opt-in watching can come later).
+      this.relay?.watch(s.broadcasterId);
+      this.emitStreams(s.broadcasterId);
+    }
+  }
+
+  /** Tell the UI/mixer which streams of a participant to show/play. */
+  private emitStreams(userId: string): void {
+    const peer = this.peers.get(userId);
+    const mesh = peer ? visibleStreams([...peer.streams.values()]) : [];
+    const relayed = this.relayDecoders.get(userId)?.dec.stream;
+    this.cb.onRemoteStreams(userId, relayed ? [...mesh, relayed] : mesh);
   }
 
   // ---------- internals ----------
@@ -278,6 +414,7 @@ export class CallManager {
         // Drop peers no longer present.
         for (const [id, peer] of this.peers) {
           if (!ev.participants.includes(id)) {
+            this.relay?.detachPeer(id);
             peer.pc.close();
             this.peers.delete(id);
             this.cb.onRemoteStreams(id, []);
@@ -289,6 +426,7 @@ export class CallManager {
       case 'call_peer_left': {
         const peer = this.peers.get(ev.user_id);
         if (peer) {
+          this.relay?.detachPeer(ev.user_id);
           peer.pc.close();
           this.peers.delete(ev.user_id);
           this.cb.onRemoteStreams(ev.user_id, []);
@@ -314,7 +452,9 @@ export class CallManager {
     this.peers.set(userId, peer);
 
     if (this.micStream) this.addStreamTracks(peer, this.micStream);
-    if (this.screenStream) this.addStreamTracks(peer, this.screenStream);
+    if (this.meshBroadcast) this.addStreamTracks(peer, this.meshBroadcast);
+    // Pre-negotiated relay data channels ride this same connection.
+    this.relay?.attachPeer(userId, pc);
 
     pc.onnegotiationneeded = async () => {
       try {
@@ -361,7 +501,7 @@ export class CallManager {
     for (const [id, s] of peer.streams) {
       if (s.getTracks().length === 0) peer.streams.delete(id); // fully gone
     }
-    this.cb.onRemoteStreams(userId, visibleStreams([...peer.streams.values()]));
+    this.emitStreams(userId);
   }
 
   private addStreamTracks(peer: Peer, stream: MediaStream) {
@@ -469,5 +609,6 @@ export class CallManager {
       out.set(userId, stats);
     }
     this.cb.onStats(out);
+    if (this.relay) this.cb.onRelayStats?.(this.relay.stats());
   }
 }

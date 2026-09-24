@@ -76,7 +76,26 @@
     return call ? store.memberName(call.serverId, call.spaceId, userId) : userId;
   }
 
+  /** Relay-tree status of a broadcast we watch (experimental relay transport). */
+  function relayLine(userId: string): string {
+    const r = call?.relay?.incoming[userId];
+    if (!r || !r.parent) return '';
+    const via = r.parent === userId ? 'direct' : `via ${name(r.parent)}`;
+    const reduced = r.rxLayer >= 0 && r.rxLayer < 2 ? ' (reduced fps)' : '';
+    return `relay ${via} · ${r.rxFps}fps${reduced}`;
+  }
+
+  /** Our own relayed broadcast: who we feed directly and how deep the tree is. */
+  function relayOutLine(): string {
+    const o = call?.relay?.outgoing;
+    if (!o) return '';
+    const direct = Object.values(o.tree).filter((p) => p === call?.selfId).length;
+    return `relay · ${o.viewers.length} watching · ${direct} fed directly`;
+  }
+
   function statLine(userId: string): string {
+    const relay = relayLine(userId);
+    if (relay) return relay;
     const st = call?.stats[userId];
     if (!st) return '';
     const parts: string[] = [];
@@ -94,7 +113,9 @@
 
   const uploadEstimate = $derived(
     call && call.broadcasting
-      ? (s.maxBitrateKbps * Math.max(call.participants.length - 1, 1)) / 1000
+      ? call.relay?.outgoing
+        ? (s.maxBitrateKbps * Math.max(1, Object.values(call.relay.outgoing.tree).filter((p) => p === call.selfId).length)) / 1000
+        : (s.maxBitrateKbps * Math.max(call.participants.length - 1, 1)) / 1000
       : 0,
   );
 </script>
@@ -196,6 +217,23 @@
           <input type="checkbox" bind:checked={s.systemAudio} />
           Game/system audio
         </label>
+        <label title="Relay: encode once, viewers pass the stream on to each other. Applies from the next share.">
+          Transport
+          <select bind:value={s.transport} disabled={call.broadcasting}>
+            <option value="webrtc">WebRTC mesh</option>
+            <option value="relay">Relay tree (experimental)</option>
+          </select>
+        </label>
+        <label title="Upload you can spare to pass others' relayed broadcasts on">
+          Relay upload
+          <select bind:value={s.relayUploadMbps} onchange={() => store.applyBroadcastSettings()}>
+            <option value={0}>none</option>
+            <option value={10}>10 Mb/s</option>
+            <option value={20}>20 Mb/s</option>
+            <option value={50}>50 Mb/s</option>
+            <option value={100}>100 Mb/s</option>
+          </select>
+        </label>
         {#if call.outputDevices.length > 1}
           <label>
             Call audio output
@@ -213,7 +251,7 @@
           </label>
         {/if}
         {#if uploadEstimate > 0}
-          <span class="estimate">≈{uploadEstimate.toFixed(0)} Mb/s upload ({call.participants.length - 1} viewer{call.participants.length === 2 ? '' : 's'})</span>
+          <span class="estimate">≈{uploadEstimate.toFixed(0)} Mb/s upload ({call.relay?.outgoing ? 'relay tree' : `${call.participants.length - 1} viewer${call.participants.length === 2 ? '' : 's'}`})</span>
         {/if}
         {#if s.systemAudio && Object.keys(call.remoteStreams).length > 0}
           <p class="hint">
@@ -231,7 +269,7 @@
           <!-- svelte-ignore a11y_media_has_caption -->
           <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
           <video autoplay playsinline muted controls use:srcObject={call.manager.localScreen} onclick={() => toggleSpotlight(id)} ondblclick={(e) => toggleFullscreen(e.currentTarget)} title={(spotlightId === id ? 'Click to shrink' : 'Click to enlarge') + ' · Double-click for fullscreen'}></video>
-          <figcaption>You (preview) · {statLine(call.participants.find((p) => p !== call.selfId) ?? '')}</figcaption>
+          <figcaption>You (preview) · {relayOutLine() || statLine(call.participants.find((p) => p !== call.selfId) ?? '')}</figcaption>
         </figure>
       {/if}
       {#each Object.entries(call.remoteStreams) as [userId, streams] (userId)}

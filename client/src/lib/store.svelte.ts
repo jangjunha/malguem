@@ -9,6 +9,7 @@
  */
 import { Api, type Member, type Space, type StickerMeta, type WireMessage } from './api';
 import { CallManager, DEFAULT_BROADCAST, type BroadcastSettings, type PeerStats } from './call';
+import type { HubStats } from './relay/hub';
 import { AudioMixer } from './mixer';
 import { credentials, migrateLegacyAccount, type AccountIndex } from './credentials';
 import {
@@ -59,6 +60,8 @@ export interface ActiveCall {
   participants: string[];
   remoteStreams: Record<string, MediaStream[]>;
   stats: Record<string, PeerStats>;
+  /** Relay-tree engine state (experimental relay transport). */
+  relay: HubStats | null;
   micMuted: boolean;
   /** Incoming audio silenced (and mic forced muted, Discord-style). */
   deafened: boolean;
@@ -777,6 +780,9 @@ class AppStore {
         onStats: (stats) => {
           if (this.call) this.call.stats = Object.fromEntries(stats);
         },
+        onRelayStats: (relay) => {
+          if (this.call) this.call.relay = relay;
+        },
         onBroadcastChanged: (broadcasting) => {
           if (this.call) this.call.broadcasting = broadcasting;
         },
@@ -797,6 +803,7 @@ class AppStore {
       participants: [conn.userId],
       remoteStreams: {},
       stats: {},
+      relay: null,
       micMuted: false,
       deafened: false,
       broadcasting: false,
