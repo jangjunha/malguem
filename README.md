@@ -49,7 +49,8 @@ See [docs/DECISIONS.md](docs/DECISIONS.md) for why each of these was chosen,
 server/    malguem-server: signaling + ciphertext storage (Rust, axum, SQLite)
 client/    desktop app (Tauri v2 + Svelte 5 + TypeScript)
 deploy/    docker-compose, Caddyfile, coturn config
-docs/      decisions, protocol, crypto design, spike checklist
+docs/      decisions, protocol, crypto design, spike checklist, experiments
+sim/       network-emulated simulator for the relayed broadcast (Linux, root)
 ```
 
 ## Running the server (operator quick start)
@@ -109,6 +110,9 @@ Early development. Feature scope for v1 (deliberately small):
 - [x] Screen share with sender-side codec/bitrate/resolution/fps controls
       and system-audio capture — *built, pending the
       [Windows spike](docs/SPIKE.md)*
+- [ ] Relayed screen broadcast (encode once, viewers pass it on) —
+      *experimental, simulated; see
+      [docs/experiments/relay-broadcast.md](docs/experiments/relay-broadcast.md)*
 - [ ] Windows installer + auto-update (Tauri bundling configured; updater
       and release pipeline still to do)
 
