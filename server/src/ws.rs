@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::auth::user_for_token;
 use crate::error::ApiError;
-use crate::spaces::{channel_space, space_role};
+use crate::spaces::{channel_space, member_ids, space_role};
 use crate::state::SharedState;
 
 /// In-memory registry of live WebSocket connections and per-channel call
@@ -28,6 +28,8 @@ struct HubInner {
     next_conn: u64,
     conns: HashMap<String, Vec<(u64, mpsc::UnboundedSender<String>)>>,
     calls: HashMap<String, HashSet<String>>,
+    /// channel → participants currently sharing their screen.
+    live: HashMap<String, HashSet<String>>,
 }
 
 impl Hub {
@@ -58,6 +60,18 @@ impl Hub {
         self.send_many(std::slice::from_ref(&user_id.to_string()), event);
     }
 
+    /// Send to one specific connection of a user (e.g. a snapshot on connect).
+    fn send_to_conn(&self, user_id: &str, conn_id: u64, event: &Value) {
+        let g = self.inner.lock().unwrap();
+        if let Some(list) = g.conns.get(user_id) {
+            for (id, tx) in list {
+                if *id == conn_id {
+                    let _ = tx.send(event.to_string());
+                }
+            }
+        }
+    }
+
     pub fn send_many(&self, users: &[String], event: &Value) {
         let text = event.to_string();
         let g = self.inner.lock().unwrap();
@@ -79,6 +93,9 @@ impl Hub {
 
     fn call_leave(&self, channel_id: &str, user_id: &str) -> Option<Vec<String>> {
         let mut g = self.inner.lock().unwrap();
+        if let Some(live) = g.live.get_mut(channel_id) {
+            live.remove(user_id);
+        }
         let roster = g.calls.get_mut(channel_id)?;
         if !roster.remove(user_id) {
             return None;
@@ -86,12 +103,17 @@ impl Hub {
         let remaining: Vec<String> = roster.iter().cloned().collect();
         if remaining.is_empty() {
             g.calls.remove(channel_id);
+            g.live.remove(channel_id);
         }
         Some(remaining)
     }
 
     fn leave_all(&self, user_id: &str) -> Vec<(String, Vec<String>)> {
         let mut g = self.inner.lock().unwrap();
+        g.live.retain(|_, set| {
+            set.remove(user_id);
+            !set.is_empty()
+        });
         let mut out = Vec::new();
         g.calls.retain(|channel, roster| {
             if roster.remove(user_id) {
@@ -100,6 +122,40 @@ impl Hub {
             !roster.is_empty()
         });
         out
+    }
+
+    /// Mark a call participant as (not) sharing their screen. Returns false if
+    /// they aren't in the call.
+    fn set_streaming(&self, channel_id: &str, user_id: &str, streaming: bool) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if !g.calls.get(channel_id).is_some_and(|r| r.contains(user_id)) {
+            return false;
+        }
+        let live = g.live.entry(channel_id.to_string()).or_default();
+        if streaming {
+            live.insert(user_id.to_string());
+        } else {
+            live.remove(user_id);
+        }
+        if live.is_empty() {
+            g.live.remove(channel_id);
+        }
+        true
+    }
+
+    /// Who is in a channel's call and who of them is streaming (sorted).
+    fn presence(&self, channel_id: &str) -> (Vec<String>, Vec<String>) {
+        let g = self.inner.lock().unwrap();
+        let sorted = |set: Option<&HashSet<String>>| {
+            let mut v: Vec<String> = set.map(|s| s.iter().cloned().collect()).unwrap_or_default();
+            v.sort();
+            v
+        };
+        (sorted(g.calls.get(channel_id)), sorted(g.live.get(channel_id)))
+    }
+
+    fn active_calls(&self) -> Vec<String> {
+        self.inner.lock().unwrap().calls.keys().cloned().collect()
     }
 
     fn in_call(&self, channel_id: &str, user_id: &str) -> bool {
@@ -150,6 +206,8 @@ pub async fn ws_handler(
 enum ClientMsg {
     CallJoin { channel_id: String },
     CallLeave { channel_id: String },
+    /// A call participant started/stopped sharing their screen (shown as LIVE).
+    CallStreaming { channel_id: String, streaming: bool },
     Signal {
         channel_id: String,
         to: String,
@@ -164,6 +222,7 @@ async fn handle_socket(state: SharedState, user_id: String, socket: WebSocket) {
     let (conn_id, mut rx) = state.hub.register(&user_id);
 
     state.hub.send_to(&user_id, &json!({ "type": "hello", "user_id": user_id }));
+    send_presence_snapshot(&state, &user_id, conn_id);
 
     let writer = tokio::spawn(async move {
         while let Some(text) = rx.recv().await {
@@ -208,10 +267,16 @@ fn handle_client_msg(state: &SharedState, user_id: &str, msg: ClientMsg) {
                 &others,
                 &json!({ "type": "call_peer_joined", "channel_id": channel_id, "user_id": user_id }),
             );
+            broadcast_presence(state, &channel_id);
         }
         ClientMsg::CallLeave { channel_id } => {
             if let Some(remaining) = state.hub.call_leave(&channel_id, user_id) {
                 broadcast_leave(state, &channel_id, user_id, &remaining);
+            }
+        }
+        ClientMsg::CallStreaming { channel_id, streaming } => {
+            if state.hub.set_streaming(&channel_id, user_id, streaming) {
+                broadcast_presence(state, &channel_id);
             }
         }
         ClientMsg::Signal { channel_id, to, payload, sig } => {
@@ -244,6 +309,47 @@ fn broadcast_leave(state: &SharedState, channel_id: &str, user_id: &str, remaini
         remaining,
         &json!({ "type": "call_roster", "channel_id": channel_id, "participants": remaining }),
     );
+    broadcast_presence(state, channel_id);
+}
+
+/// Who's in a channel's call, for every member of its space — so everyone can
+/// see who is talking where before joining (Discord's voice channel list).
+fn presence_event(state: &SharedState, channel_id: &str) -> Option<(Value, Vec<String>)> {
+    let (space_id, members) = state
+        .db
+        .with(|c| {
+            let Some(space_id) = channel_space(c, channel_id)? else {
+                return Ok(None);
+            };
+            let members = member_ids(c, &space_id)?;
+            Ok(Some((space_id, members)))
+        })
+        .ok()
+        .flatten()?;
+    let (participants, streaming) = state.hub.presence(channel_id);
+    let event = json!({
+        "type": "call_presence", "space_id": space_id, "channel_id": channel_id,
+        "participants": participants, "streaming": streaming,
+    });
+    Some((event, members))
+}
+
+fn broadcast_presence(state: &SharedState, channel_id: &str) {
+    if let Some((event, members)) = presence_event(state, channel_id) {
+        state.hub.send_many(&members, &event);
+    }
+}
+
+/// On connect: the calls currently running in the user's spaces, to the new
+/// connection only (the user's other connections are already up to date).
+fn send_presence_snapshot(state: &SharedState, user_id: &str, conn_id: u64) {
+    for channel_id in state.hub.active_calls() {
+        if let Some((event, members)) = presence_event(state, &channel_id) {
+            if members.iter().any(|m| m == user_id) {
+                state.hub.send_to_conn(user_id, conn_id, &event);
+            }
+        }
+    }
 }
 
 fn is_channel_member(state: &SharedState, channel_id: &str, user_id: &str) -> bool {

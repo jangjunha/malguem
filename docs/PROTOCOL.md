@@ -82,6 +82,7 @@ with a `type` tag.
 ```jsonc
 {"type": "call_join",  "channel_id": "…"}
 {"type": "call_leave", "channel_id": "…"}
+{"type": "call_streaming", "channel_id": "…", "streaming": true}
 {"type": "signal", "channel_id": "…", "to": "<user_id>",
  "payload": { /* opaque to server */ }, "sig": "…"}
 {"type": "ping"}
@@ -98,6 +99,8 @@ space and the recipient is online; it never inspects it.
 {"type": "pong"}
 {"type": "message_new", "channel_id": "…", "message": {…}}   // same shape as REST history
 {"type": "call_roster", "channel_id": "…", "participants": ["user_id", …]}
+{"type": "call_presence", "space_id": "…", "channel_id": "…",
+ "participants": ["user_id", …], "streaming": ["user_id", …]}
 {"type": "call_peer_joined", "channel_id": "…", "user_id": "…"}
 {"type": "call_peer_left",   "channel_id": "…", "user_id": "…"}
 {"type": "signal", "channel_id": "…", "from": "…", "payload": {…}, "sig": "…"}
@@ -122,9 +125,23 @@ space and the recipient is online; it never inspects it.
   uses perfect negotiation with the lexicographically smaller user id as the
   polite peer).
 - Disconnecting the WebSocket implies `call_leave` from all rosters.
+- `call_presence` goes to **every member of the channel's space** (in the
+  call or not) whenever its roster or streaming set changes, so clients can
+  show who is in which call before joining; an empty `participants` means the
+  call ended. Each new connection first gets a snapshot: one `call_presence`
+  per running call in the user's spaces. `call_streaming` (accepted only from
+  a participant) marks them LIVE in that presence; leaving clears it.
 - Voice and screen-share travel over the same peer connections; screen share
   is an extra video (+ audio) track added by the broadcaster with sender-side
   codec/bitrate/resolution/fps settings applied locally.
+- `signal` payloads are opaque to the server. Clients send `{"kind": "sdp", …}`
+  and `{"kind": "ice", …}` for negotiation, and
+  `{"kind": "state", "state": {"muted": bool, "deafened": bool, "streaming": bool}}`
+  to show their mic/deafen/screen-share state to each peer (sent on connect
+  and on every change). Screen shares are opt-in: a viewer sends
+  `{"kind": "watch", "watch": true|false}` to the broadcaster, who adds the
+  screen tracks to (or removes them from) only that viewer's connection.
+  Clients ignore kinds they don't know.
 
 ## Versioning
 

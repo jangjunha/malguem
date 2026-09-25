@@ -262,6 +262,28 @@ async fn full_flow() {
     let roster = expect_event(&mut alice_ws, "call_roster").await;
     assert_eq!(roster["participants"].as_array().unwrap().len(), 1);
 
+    // Bob isn't in the call but, as a space member, sees who is.
+    let presence = expect_event(&mut bob_ws, "call_presence").await;
+    assert_eq!(presence["channel_id"].as_str().unwrap(), channel_id);
+    assert_eq!(presence["participants"][0].as_str().unwrap(), alice.id);
+    // ...and a fresh connection gets a snapshot of running calls.
+    let mut bob_ws2 = ws_connect(&server, &bob).await;
+    let snap = expect_event(&mut bob_ws2, "call_presence").await;
+    assert_eq!(snap["participants"][0].as_str().unwrap(), alice.id);
+    drop(bob_ws2);
+
+    // Streaming flag: only accepted from participants, fanned out as presence.
+    alice_ws
+        .send(Message::Text(
+            json!({ "type": "call_streaming", "channel_id": channel_id, "streaming": true })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let live = expect_event(&mut bob_ws, "call_presence").await;
+    assert_eq!(live["streaming"][0].as_str(), Some(alice.id.as_str()), "{live}");
+
     bob_ws
         .send(Message::Text(
             json!({ "type": "call_join", "channel_id": channel_id }).to_string().into(),
@@ -292,6 +314,9 @@ async fn full_flow() {
     drop(bob_ws);
     let left = expect_event(&mut alice_ws, "call_peer_left").await;
     assert_eq!(left["user_id"].as_str().unwrap(), bob.id);
+    let presence = expect_event(&mut alice_ws, "call_presence").await;
+    assert_eq!(presence["participants"].as_array().unwrap().len(), 1);
+    assert_eq!(presence["streaming"][0].as_str().unwrap(), alice.id);
 
     // TURN credentials: HMAC ephemeral creds with both STUN and TURN urls.
     let turn: Value = client

@@ -25,11 +25,60 @@
   const inThisCall = $derived(store.call?.serverId === serverId && store.call?.channelId === channelId);
   const locked = $derived(store.lockedOf(serverId, space.id));
   const isOwner = $derived(space.owner_id === store.userIdOf(serverId));
+  const presence = $derived(store.presenceOf(serverId, channelId));
 
-  // Keep scrolled to the bottom as messages arrive.
+  // ---- scrolling ----
+  // Follow new messages only while the reader is at the bottom; if they've
+  // scrolled up to read history, leave them there and offer a jump button.
+  // Content that grows after render (images, link cards, stickers) and the
+  // call panel resizing the viewport both keep a pinned view pinned.
+  let content = $state<HTMLElement | null>(null);
+  let pinned = $state(true);
+  let unseen = $state(0);
+  const PIN_SLACK_PX = 48;
+
+  function scrollToBottom() {
+    if (!scroller) return;
+    scroller.scrollTop = scroller.scrollHeight;
+    pinned = true;
+    unseen = 0;
+  }
+
+  function onScroll() {
+    if (!scroller) return;
+    pinned = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= PIN_SLACK_PX;
+    if (pinned) unseen = 0;
+  }
+
+  // New channel: start at its latest message.
+  let shownChannel = '';
+  let shownCount = 0;
   $effect(() => {
-    msgs.length;
-    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    const count = msgs.length;
+    const key = `${serverId}|${channelId}`;
+    if (!scroller) return;
+    if (key !== shownChannel) {
+      shownChannel = key;
+      shownCount = count;
+      scrollToBottom();
+      return;
+    }
+    const added = count - shownCount;
+    shownCount = count;
+    if (added <= 0) return;
+    const mine = msgs[count - 1]?.senderId === store.userIdOf(serverId);
+    if (pinned || mine) scrollToBottom();
+    else unseen += added;
+  });
+
+  $effect(() => {
+    if (!scroller || !content) return;
+    const ro = new ResizeObserver(() => {
+      if (pinned && scroller) scroller.scrollTop = scroller.scrollHeight;
+    });
+    ro.observe(scroller);
+    ro.observe(content);
+    return () => ro.disconnect();
   });
 
   /** Recompute the emoji menu from the `:token` immediately before the caret. */
@@ -122,9 +171,23 @@
   <header>
     <span class="title"># {channel?.name}</span>
     {#if !inThisCall}
-      <button class="primary" onclick={() => store.joinCall(serverId, channelId)} disabled={store.call !== null}>
-        Join call
-      </button>
+      <div class="join">
+        {#if presence}
+          <span class="in-call" title={presence.participants.map((p) => store.memberName(serverId, space.id, p)).join(', ')}>
+            {#each presence.participants.slice(0, 4) as p (p)}
+              <span class="mini">{store.memberName(serverId, space.id, p).slice(0, 1).toUpperCase()}</span>
+            {/each}
+            {presence.participants.length} in call{presence.streaming.length ? ' · LIVE' : ''}
+          </span>
+        {/if}
+        <button
+          class="primary"
+          onclick={() => store.joinCall(serverId, channelId)}
+          title={store.call ? 'Leaves your current call' : ''}
+        >
+          {store.call ? 'Switch to this call' : 'Join call'}
+        </button>
+      </div>
     {/if}
   </header>
 
@@ -132,7 +195,8 @@
     <CallPanel />
   {/if}
 
-  <div class="messages" bind:this={scroller}>
+  <div class="messages" bind:this={scroller} onscroll={onScroll}>
+    <div class="content" bind:this={content}>
     {#if locked}
       <div class="locked">
         Waiting for another member to share this space's encryption key…
@@ -150,9 +214,15 @@
         </div>
       </div>
     {/each}
+    </div>
   </div>
 
   <div class="composer">
+    {#if !pinned && unseen > 0}
+      <button class="jump" onclick={scrollToBottom}>
+        {unseen} new message{unseen === 1 ? '' : 's'} — jump to latest ↓
+      </button>
+    {/if}
     {#if showStickers}
       <StickerPicker
         {serverId}
@@ -198,7 +268,7 @@
 </div>
 
 <style>
-  .view { display: flex; flex-direction: column; height: 100%; }
+  .view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
   header {
     display: flex;
     align-items: center;
@@ -207,8 +277,39 @@
     border-bottom: 1px solid var(--bg-3);
   }
   .title { font-weight: 600; }
+  .join { display: flex; align-items: center; gap: 10px; }
+  .in-call { display: flex; align-items: center; gap: 2px; color: var(--ok); font-size: 12.5px; }
+  .in-call .mini {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--bg-3);
+    color: var(--fg-0);
+    display: grid;
+    place-items: center;
+    font-size: 10px;
+    font-weight: 700;
+    margin-right: -4px;
+    box-shadow: 0 0 0 2px var(--bg-2);
+  }
+  .in-call .mini:last-of-type { margin-right: 6px; }
 
-  .messages { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .messages { flex: 1 1 0; min-height: 120px; overflow-y: auto; overflow-anchor: none; padding: 12px 16px; }
+  .content { display: flex; flex-direction: column; gap: 8px; }
+  .jump {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 15;
+    background: var(--accent);
+    color: #0d1117;
+    font-weight: 600;
+    font-size: 12.5px;
+    border-radius: 999px;
+    padding: 5px 14px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  }
   .msg { display: flex; flex-direction: column; }
   .msg .meta { color: var(--fg-1); font-size: 12px; }
   .msg .meta b { color: var(--fg-0); }

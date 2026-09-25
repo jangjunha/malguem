@@ -8,9 +8,18 @@
  * connection objects (identity, api, socket, space keys) live in `conns`.
  */
 import { Api, type Member, type Space, type StickerMeta, type WireMessage } from './api';
-import { CallManager, DEFAULT_BROADCAST, type BroadcastSettings, type PeerStats } from './call';
+import {
+  CallManager,
+  DEFAULT_BROADCAST,
+  type BroadcastSettings,
+  type PeerLink,
+  type PeerState,
+  type PeerStats,
+} from './call';
 import type { HubStats } from './relay/hub';
+import { MicInput, type MicLevel } from './mic';
 import { AudioMixer } from './mixer';
+import { prefs, type CallPrefs, type KeybindPrefs, type VoicePrefs } from './prefs';
 import { credentials, migrateLegacyAccount, type AccountIndex } from './credentials';
 import {
   b64u,
@@ -29,8 +38,16 @@ import {
   unb64u,
   type Identity,
 } from './crypto';
-import { playJoin, playLeave } from './sounds';
-import { EventSocket, type ServerEvent } from './ws';
+import {
+  playJoin,
+  playLeave,
+  playStreamStart,
+  playStreamStop,
+  playToggle,
+  setSoundPrefs,
+  type SoundPrefs,
+} from './sounds';
+import { EventSocket, type ServerEvent, type SocketStatus } from './ws';
 
 export interface ChatMessage {
   id: string;
@@ -46,7 +63,7 @@ export interface ChatMessage {
   ok: boolean; // false = could not decrypt/verify
 }
 
-export interface OutputDevice {
+export interface AudioDevice {
   deviceId: string;
   label: string;
 }
@@ -62,16 +79,21 @@ export interface ActiveCall {
   stats: Record<string, PeerStats>;
   /** Relay-tree engine state (experimental relay transport). */
   relay: HubStats | null;
-  micMuted: boolean;
-  /** Incoming audio silenced (and mic forced muted, Discord-style). */
-  deafened: boolean;
   broadcasting: boolean;
-  /** userId → playback volume (1 = 100%, up to 2 = 200%). */
-  peerVolumes: Record<string, number>;
-  /** Selected call-audio output device ('' = system default). */
-  outputDeviceId: string;
-  /** Pickable audio outputs, when the webview supports choosing one. */
-  outputDevices: OutputDevice[];
+  /** The share picker is open / the broadcast is starting. */
+  broadcastStarting: boolean;
+  /** userId → the mute/deafen/streaming state they announced. */
+  peerStates: Record<string, PeerState>;
+  /** userId → media connection health. */
+  links: Record<string, PeerLink>;
+  /** Broadcasters whose screen we're watching. */
+  watching: string[];
+}
+
+/** Who's in a channel's call, as seen from outside it. */
+export interface CallPresence {
+  participants: string[];
+  streaming: string[];
 }
 
 /** Reactive, non-secret view of a connected server, shown in the UI. */
@@ -132,8 +154,38 @@ class AppStore {
   call = $state<ActiveCall | null>(null);
   broadcastSettings = $state<BroadcastSettings>({ ...DEFAULT_BROADCAST });
 
+  /** Mic muted — kept outside the call so you can mute before joining, like Discord. */
+  micMuted = $state(prefs.loadSelf().micMuted);
+  /** Incoming audio silenced (and mic forced muted, Discord-style). */
+  deafened = $state(prefs.loadSelf().deafened);
+  voice = $state<VoicePrefs>(prefs.loadVoice());
+  keybinds = $state<KeybindPrefs>(prefs.loadKeybinds());
+  /** `serverId|userId` → playback volume (1 = 100%, up to 2 = 200%), remembered across calls. */
+  userVolumes = $state<Record<string, number>>(prefs.loadVolumes());
+  /** Live mic meter while in a call or testing the mic. */
+  micLevel = $state<MicLevel | null>(null);
+  /** userIds currently talking in the call (self included). */
+  speaking = $state<Record<string, boolean>>({});
+  inputDevices = $state<AudioDevice[]>([]);
+  /** Pickable audio outputs, when the webview supports choosing one. */
+  outputDevices = $state<AudioDevice[]>([]);
+  sounds = $state<SoundPrefs>(prefs.loadSounds());
+  callPrefs = $state<CallPrefs>(prefs.loadCall());
+  /** `serverId|channelId` → running call in that channel (from the server). */
+  presence = $state<Record<string, CallPresence>>({});
+  /** serverId → event-socket status (reconnect banner). */
+  socketStatus = $state<Record<string, SocketStatus>>({});
+  /** Result of the last hotkey registration (OS-wide shortcuts, conflicts). */
+  hotkeyStatus = $state<{ global: string[]; errors: string[] }>({ global: [], errors: [] });
+  /** Settings dialog, opened from the user panel. */
+  settingsOpen = $state<null | 'voice' | 'keybinds' | 'sounds'>(null);
+
   /** WebAudio playback graph for the current call. Never reactive. */
   private mixer: AudioMixer | null = null;
+  /** Mic capture for the call (or a mic test in settings). Never reactive. */
+  private mic: MicInput | null = null;
+  private speakingTimer: ReturnType<typeof setInterval> | null = null;
+  private micTestWanted = false;
   /** Mic muted-state captured when deafening, restored on undeafen. */
   private preDeafenMicMuted = false;
 
@@ -170,6 +222,10 @@ class AppStore {
 
   stickersOf(serverId: string, spaceId: string): StickerMeta[] {
     return this.stickers[ck(serverId, spaceId)] ?? [];
+  }
+
+  presenceOf(serverId: string, channelId: string): CallPresence | null {
+    return this.presence[ck(serverId, channelId)] ?? null;
   }
 
   lockedOf(serverId: string, spaceId: string): boolean {
@@ -213,6 +269,7 @@ class AppStore {
   // ---------- lifecycle ----------
 
   async bootstrap() {
+    setSoundPrefs($state.snapshot(this.sounds));
     await migrateLegacyAccount();
     const vault = credentials.loadVault();
     if (vault.length === 0) {
@@ -346,6 +403,8 @@ class AppStore {
     for (const key of Object.keys(this.messages)) if (key.startsWith(serverId + '|')) delete this.messages[key];
     for (const key of Object.keys(this.stickers)) if (key.startsWith(serverId + '|')) delete this.stickers[key];
     for (const key of Object.keys(this.lockedSpaces)) if (key.startsWith(serverId + '|')) delete this.lockedSpaces[key];
+    this.clearPresence(serverId);
+    delete this.socketStatus[serverId];
     for (const key of [...this.stickerUrls.keys()]) {
       if (key.startsWith(serverId + '|')) {
         URL.revokeObjectURL(this.stickerUrls.get(key)!);
@@ -370,13 +429,38 @@ class AppStore {
   private connectSocket(conn: ServerConn) {
     if (!conn.api.token) return;
     conn.socket?.close();
-    conn.socket = new EventSocket(conn.serverUrl, conn.api.token);
-    conn.socket.onEvent((ev) => void this.handleEvent(conn.id, ev));
-    conn.socket.connect();
+    const socket = new EventSocket(conn.serverUrl, conn.api.token);
+    conn.socket = socket;
+    socket.onEvent((ev) => void this.handleEvent(conn.id, ev));
+    // The server sends a fresh presence snapshot right after (re)connecting;
+    // drop what we knew so calls that ended while we were away disappear.
+    socket.onOpen(() => this.clearPresence(conn.id));
+    socket.onStatus((st) => {
+      if (conn.socket !== socket) return;
+      this.socketStatus[conn.id] = st;
+      if (st.state === 'open') this.patchServer(conn.id, { status: 'online', error: null });
+      else if (st.state === 'reconnecting') this.patchServer(conn.id, { status: 'connecting', error: 'reconnecting…' });
+    });
+    socket.connect();
+  }
+
+  /** Reconnect-banner "Retry now". */
+  retryConnection(serverId: string) {
+    this.conn(serverId)?.socket?.retryNow();
+  }
+
+  private clearPresence(serverId: string) {
+    for (const key of Object.keys(this.presence)) if (key.startsWith(serverId + '|')) delete this.presence[key];
   }
 
   private async handleEvent(serverId: string, ev: ServerEvent) {
     switch (ev.type) {
+      case 'call_presence': {
+        const key = ck(serverId, ev.channel_id);
+        if (ev.participants.length === 0) delete this.presence[key];
+        else this.presence[key] = { participants: ev.participants, streaming: ev.streaming ?? [] };
+        break;
+      }
       case 'message_new': {
         const msg = await this.decryptWire(serverId, ev.channel_id, ev.message);
         const key = ck(serverId, ev.channel_id);
@@ -756,7 +840,24 @@ class AppStore {
       ? [{ urls: turn.urls, username: turn.username, credential: turn.credential }]
       : [{ urls: turn.urls }];
 
-    this.mixer = new AudioMixer();
+    this.stopMicTest();
+    let mic: MicInput;
+    try {
+      mic = await MicInput.open($state.snapshot(this.voice));
+    } catch (e) {
+      this.error = `Could not open the microphone: ${e instanceof Error ? e.message : e}`;
+      return;
+    }
+    mic.setMuted(this.micMuted);
+    this.attachMicMeter(mic, conn.userId);
+    this.mic = mic;
+
+    const mixer = new AudioMixer();
+    this.mixer = mixer;
+    mixer.setDeafened(this.deafened);
+    if (this.voice.outputDeviceId) {
+      mixer.setSinkId(this.voice.outputDeviceId).catch((e) => console.warn('output device', e));
+    }
     const manager = new CallManager(
       conn.socket,
       conn.identity,
@@ -773,6 +874,8 @@ class AppStore {
           if (!this.call) return;
           // The mixer plays all audio (voice + shared system audio); the UI
           // only renders the video tiles from these same streams.
+          const v = this.userVolumes[ck(serverId, userId)];
+          if (v !== undefined) this.mixer?.setVolume(userId, v);
           this.mixer?.setUserStreams(userId, streams);
           if (streams.length === 0) delete this.call.remoteStreams[userId];
           else this.call.remoteStreams[userId] = streams;
@@ -784,10 +887,33 @@ class AppStore {
           if (this.call) this.call.relay = relay;
         },
         onBroadcastChanged: (broadcasting) => {
-          if (this.call) this.call.broadcasting = broadcasting;
+          if (!this.call) return;
+          if (this.call.broadcasting !== broadcasting) (broadcasting ? playStreamStart : playStreamStop)();
+          this.call.broadcasting = broadcasting;
+        },
+        onPeerState: (userId, state) => {
+          if (!this.call) return;
+          const was = this.call.peerStates[userId]?.streaming ?? false;
+          this.call.peerStates[userId] = state;
+          if (state.streaming !== was) {
+            (state.streaming ? playStreamStart : playStreamStop)();
+            if (state.streaming && this.callPrefs.autoWatch) this.call.manager.setWatching(userId, true);
+          }
+        },
+        onPeerLink: (userId, link) => {
+          if (this.call) this.call.links[userId] = link;
+        },
+        onWatchingChanged: (watching) => {
+          if (this.call) this.call.watching = watching;
         },
         onPeerJoined: () => playJoin(),
-        onPeerLeft: () => playLeave(),
+        onPeerLeft: (userId) => {
+          playLeave();
+          if (this.call) {
+            delete this.call.peerStates[userId];
+            delete this.call.links[userId];
+          }
+        },
         onEnded: () => {
           this.call = null;
         },
@@ -804,106 +930,210 @@ class AppStore {
       remoteStreams: {},
       stats: {},
       relay: null,
-      micMuted: false,
-      deafened: false,
       broadcasting: false,
-      peerVolumes: {},
-      outputDeviceId: '',
-      outputDevices: [],
+      broadcastStarting: false,
+      peerStates: {},
+      links: {},
+      watching: [],
     };
     try {
-      await manager.join();
-      void this.refreshOutputDevices();
+      await manager.join(mic.stream, { muted: this.micMuted, deafened: this.deafened });
+      playJoin();
+      void this.refreshDevices();
+      this.speakingTimer = setInterval(() => this.pollSpeaking(), 100);
     } catch (e) {
-      this.mixer?.close();
-      this.mixer = null;
+      this.teardownAudio();
       this.call = null;
       this.error = `Could not join call: ${e instanceof Error ? e.message : e}`;
     }
   }
 
   leaveCall() {
-    const mixer = this.mixer;
-    this.mixer = null;
+    if (this.call) playLeave();
     this.call?.manager.leave();
-    mixer?.close();
+    this.teardownAudio();
     this.call = null;
   }
 
-  toggleMic() {
-    if (!this.call) return;
-    const muted = !this.call.micMuted;
-    this.call.micMuted = muted;
-    this.call.manager.setMicMuted(muted);
-    // Unmuting means you want to talk — so you're no longer deafened either.
-    if (!muted && this.call.deafened) {
-      this.call.deafened = false;
-      this.mixer?.setDeafened(false);
+  private teardownAudio() {
+    if (this.speakingTimer) clearInterval(this.speakingTimer);
+    this.speakingTimer = null;
+    this.mixer?.close();
+    this.mixer = null;
+    this.mic?.close();
+    this.mic = null;
+    this.micLevel = null;
+    this.speaking = {};
+  }
+
+  /** Feed the mic meter + our own speaking ring from the mic worklet. */
+  private attachMicMeter(mic: MicInput, selfId: string | null) {
+    mic.onLevel = (level) => {
+      this.micLevel = level;
+      if (!selfId) return;
+      const talking = level.open && !this.micMuted;
+      if (this.speaking[selfId] !== talking) this.speaking[selfId] = talking;
+    };
+  }
+
+  private pollSpeaking() {
+    if (!this.mixer || !this.call || document.hidden) return;
+    const now = this.mixer.speaking();
+    for (const p of this.call.participants) {
+      if (p === this.call.selfId) continue;
+      const talking = now.has(p) && !this.deafened;
+      if ((this.speaking[p] ?? false) !== talking) this.speaking[p] = talking;
     }
+  }
+
+  private announceSelf() {
+    prefs.saveSelf({ micMuted: this.micMuted, deafened: this.deafened });
+    this.mic?.setMuted(this.micMuted);
+    this.mixer?.setDeafened(this.deafened);
+    this.call?.manager.setSelfState({ muted: this.micMuted, deafened: this.deafened });
+  }
+
+  toggleMic() {
+    this.micMuted = !this.micMuted;
+    // Unmuting means you want to talk — so you're no longer deafened either.
+    if (!this.micMuted && this.deafened) this.deafened = false;
+    playToggle(!this.micMuted);
+    this.announceSelf();
   }
 
   /** Deafen mutes everyone you hear and (Discord-style) forces your mic muted. */
   toggleDeafen() {
-    if (!this.call) return;
-    const deafened = !this.call.deafened;
-    if (deafened) {
-      this.preDeafenMicMuted = this.call.micMuted;
-      if (!this.call.micMuted) {
-        this.call.micMuted = true;
-        this.call.manager.setMicMuted(true);
-      }
-    } else if (this.call.micMuted !== this.preDeafenMicMuted) {
-      this.call.micMuted = this.preDeafenMicMuted;
-      this.call.manager.setMicMuted(this.preDeafenMicMuted);
+    this.deafened = !this.deafened;
+    if (this.deafened) {
+      this.preDeafenMicMuted = this.micMuted;
+      this.micMuted = true;
+    } else {
+      this.micMuted = this.preDeafenMicMuted;
     }
-    this.call.deafened = deafened;
-    this.mixer?.setDeafened(deafened);
+    playToggle(!this.deafened);
+    this.announceSelf();
   }
 
   setPeerVolume(userId: string, volume: number) {
     if (!this.call) return;
-    this.call.peerVolumes[userId] = volume;
+    this.userVolumes[ck(this.call.serverId, userId)] = volume;
+    prefs.saveVolumes($state.snapshot(this.userVolumes));
     this.mixer?.setVolume(userId, volume);
   }
 
   peerVolume(userId: string): number {
-    return this.call?.peerVolumes[userId] ?? 1;
+    if (!this.call) return 1;
+    return this.userVolumes[ck(this.call.serverId, userId)] ?? 1;
   }
 
-  /** Route call audio to a chosen output device (breaks system-audio loopback). */
+  // ---------- voice settings ----------
+
+  /** Persist voice prefs and apply them to the live mic/mixer. */
+  async applyVoice() {
+    const v = $state.snapshot(this.voice);
+    prefs.saveVoice(v);
+    try {
+      await this.mic?.apply(v);
+    } catch (e) {
+      this.error = `Could not switch microphone: ${e instanceof Error ? e.message : e}`;
+    }
+  }
+
   async setOutputDevice(deviceId: string) {
-    if (!this.call) return;
     try {
       await this.mixer?.setSinkId(deviceId);
-      this.call.outputDeviceId = deviceId;
+      this.voice.outputDeviceId = deviceId;
+      prefs.saveVoice($state.snapshot(this.voice));
     } catch (e) {
       this.error = `Could not switch audio output: ${e instanceof Error ? e.message : e}`;
     }
   }
 
-  private async refreshOutputDevices() {
-    if (!this.call || !AudioMixer.outputDeviceSelectable()) return;
-    if (!navigator.mediaDevices?.enumerateDevices) return;
+  /** Start/stop watching someone's screen share. */
+  watch(userId: string, on: boolean) {
+    this.call?.manager.setWatching(userId, on);
+  }
+
+  saveSounds() {
+    const v = $state.snapshot(this.sounds);
+    setSoundPrefs(v);
+    prefs.saveSounds(v);
+  }
+
+  saveCallPrefs() {
+    prefs.saveCall($state.snapshot(this.callPrefs));
+  }
+
+  saveKeybinds() {
+    prefs.saveKeybinds($state.snapshot(this.keybinds));
+  }
+
+  /** Open the mic just to show the meter in settings (no-op while in a call). */
+  async startMicTest() {
+    this.micTestWanted = true;
+    if (this.mic) return;
     try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const outputs = devices
-        .filter((d) => d.kind === 'audiooutput')
-        .map((d) => ({ deviceId: d.deviceId, label: d.label || 'Audio output' }));
-      if (this.call) this.call.outputDevices = outputs;
-    } catch {
-      /* device labels need permission we may lack; leave the list empty */
+      const mic = await MicInput.open($state.snapshot(this.voice));
+      if (this.mic || this.call || !this.micTestWanted) {
+        mic.close(); // settings closed, or a call started meanwhile and owns the mic
+        return;
+      }
+      this.attachMicMeter(mic, null);
+      this.mic = mic;
+      void this.refreshDevices();
+    } catch (e) {
+      this.error = `Could not open the microphone: ${e instanceof Error ? e.message : e}`;
     }
   }
 
+  stopMicTest() {
+    this.micTestWanted = false;
+    if (this.call || !this.mic) return;
+    this.mic.close();
+    this.mic = null;
+    this.micLevel = null;
+  }
+
+  async refreshDevices() {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const pick = (kind: MediaDeviceKind) =>
+        devices
+          .filter((d) => d.kind === kind && d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications')
+          .map((d, i) => ({ deviceId: d.deviceId, label: d.label || `Device ${i + 1}` }));
+      this.inputDevices = pick('audioinput');
+      this.outputDevices = AudioMixer.outputDeviceSelectable() ? pick('audiooutput') : [];
+    } catch {
+      /* device labels need permission we may lack; leave the lists as they are */
+    }
+  }
+
+  // ---------- broadcast ----------
+
   async toggleBroadcast() {
-    if (!this.call) return;
-    if (this.call.broadcasting) {
-      this.call.manager.stopBroadcast();
-      this.call.broadcasting = false;
-    } else {
-      this.call.manager.settings = { ...this.broadcastSettings };
-      await this.call.manager.startBroadcast();
-      this.call.broadcasting = true;
+    const call = this.call;
+    // While the share picker is open, extra clicks do nothing (a double
+    // click must neither start a second capture nor cancel the first).
+    if (!call || call.broadcastStarting) return;
+    if (call.broadcasting) {
+      call.manager.stopBroadcast();
+      call.broadcasting = false;
+      return;
+    }
+    call.manager.settings = { ...this.broadcastSettings };
+    call.broadcastStarting = true;
+    try {
+      await call.manager.startBroadcast();
+    } catch (e) {
+      // Closing the picker is a NotAllowedError/AbortError: not worth a toast.
+      const name = e instanceof DOMException ? e.name : '';
+      if (name !== 'NotAllowedError' && name !== 'AbortError') {
+        this.error = `Could not share screen: ${e instanceof Error ? e.message : e}`;
+      }
+    } finally {
+      call.broadcastStarting = false;
+      call.broadcasting = call.manager.isBroadcasting;
     }
   }
 
