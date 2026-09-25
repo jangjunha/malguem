@@ -5,6 +5,7 @@
   import { defaultBinding, eventToAccelerator, formatAccelerator } from '../lib/keybinds';
   import { MAX_GAIN } from '../lib/mixer';
   import { isTauri } from '../lib/platform';
+  import { playJoin, playStreamStart, playToggle } from '../lib/sounds';
   import { store } from '../lib/store.svelte';
 
   const v = $derived(store.voice);
@@ -60,6 +61,7 @@
   <div class="tabs" role="tablist">
     <button role="tab" aria-selected={tab === 'voice'} class:sel={tab === 'voice'} onclick={() => (store.settingsOpen = 'voice')}>Voice</button>
     <button role="tab" aria-selected={tab === 'keybinds'} class:sel={tab === 'keybinds'} onclick={() => (store.settingsOpen = 'keybinds')}>Keybinds</button>
+    <button role="tab" aria-selected={tab === 'sounds'} class:sel={tab === 'sounds'} onclick={() => (store.settingsOpen = 'sounds')}>Sounds & streams</button>
   </div>
 
   {#if tab === 'voice'}
@@ -159,6 +161,54 @@
         Automatic gain control
       </label>
     </div>
+  {:else if tab === 'sounds'}
+    <label>
+      <span class="row">Sound volume <span class="num">{Math.round(store.sounds.volume * 100)}%</span></span>
+      <input
+        type="range"
+        min="0"
+        max="100"
+        step="5"
+        value={Math.round(store.sounds.volume * 100)}
+        oninput={(e) => {
+          store.sounds.volume = e.currentTarget.valueAsNumber / 100;
+          store.saveSounds();
+        }}
+        onchange={() => playJoin()}
+      />
+    </label>
+    <div class="checks">
+      <div class="sound-row">
+        <label class="check">
+          <input type="checkbox" bind:checked={store.sounds.joinLeave} onchange={() => store.saveSounds()} />
+          Someone joins or leaves the call
+        </label>
+        <button class="link" onclick={() => playJoin()}>Preview</button>
+      </div>
+      <div class="sound-row">
+        <label class="check">
+          <input type="checkbox" bind:checked={store.sounds.stream} onchange={() => store.saveSounds()} />
+          Someone starts or stops sharing their screen
+        </label>
+        <button class="link" onclick={() => playStreamStart()}>Preview</button>
+      </div>
+      <div class="sound-row">
+        <label class="check">
+          <input type="checkbox" bind:checked={store.sounds.toggles} onchange={() => store.saveSounds()} />
+          You mute, unmute or deafen
+        </label>
+        <button class="link" onclick={() => playToggle(true)}>Preview</button>
+      </div>
+    </div>
+    <hr />
+    <label class="check">
+      <input type="checkbox" bind:checked={store.callPrefs.autoWatch} onchange={() => store.saveCallPrefs()} />
+      Watch screen shares automatically
+    </label>
+    <p class="hint">
+      Off: shares show a “Watch stream” button, and you only download (and the streamer only
+      sends) the video you choose to watch.
+    </p>
   {:else}
     <div class="binds">
       {#each ['toggleMute', 'toggleDeafen'] as const as action (action)}
@@ -232,6 +282,8 @@
   .hint.warn { color: var(--danger); }
 
   .binds { display: flex; flex-direction: column; gap: 8px; }
+  .sound-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  hr { border: none; border-top: 1px solid var(--bg-3); margin: 2px 0; width: 100%; }
   .bind { display: flex; align-items: center; gap: 10px; }
   .bind-name { flex: 1; }
   .key {

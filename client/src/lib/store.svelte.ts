@@ -12,13 +12,14 @@ import {
   CallManager,
   DEFAULT_BROADCAST,
   type BroadcastSettings,
+  type PeerLink,
   type PeerState,
   type PeerStats,
 } from './call';
 import type { HubStats } from './relay/hub';
 import { MicInput, type MicLevel } from './mic';
 import { AudioMixer } from './mixer';
-import { prefs, type KeybindPrefs, type VoicePrefs } from './prefs';
+import { prefs, type CallPrefs, type KeybindPrefs, type VoicePrefs } from './prefs';
 import { credentials, migrateLegacyAccount, type AccountIndex } from './credentials';
 import {
   b64u,
@@ -37,8 +38,16 @@ import {
   unb64u,
   type Identity,
 } from './crypto';
-import { playJoin, playLeave } from './sounds';
-import { EventSocket, type ServerEvent } from './ws';
+import {
+  playJoin,
+  playLeave,
+  playStreamStart,
+  playStreamStop,
+  playToggle,
+  setSoundPrefs,
+  type SoundPrefs,
+} from './sounds';
+import { EventSocket, type ServerEvent, type SocketStatus } from './ws';
 
 export interface ChatMessage {
   id: string;
@@ -73,8 +82,18 @@ export interface ActiveCall {
   broadcasting: boolean;
   /** The share picker is open / the broadcast is starting. */
   broadcastStarting: boolean;
-  /** userId → the mute/deafen state they announced. */
+  /** userId → the mute/deafen/streaming state they announced. */
   peerStates: Record<string, PeerState>;
+  /** userId → media connection health. */
+  links: Record<string, PeerLink>;
+  /** Broadcasters whose screen we're watching. */
+  watching: string[];
+}
+
+/** Who's in a channel's call, as seen from outside it. */
+export interface CallPresence {
+  participants: string[];
+  streaming: string[];
 }
 
 /** Reactive, non-secret view of a connected server, shown in the UI. */
@@ -150,10 +169,16 @@ class AppStore {
   inputDevices = $state<AudioDevice[]>([]);
   /** Pickable audio outputs, when the webview supports choosing one. */
   outputDevices = $state<AudioDevice[]>([]);
+  sounds = $state<SoundPrefs>(prefs.loadSounds());
+  callPrefs = $state<CallPrefs>(prefs.loadCall());
+  /** `serverId|channelId` → running call in that channel (from the server). */
+  presence = $state<Record<string, CallPresence>>({});
+  /** serverId → event-socket status (reconnect banner). */
+  socketStatus = $state<Record<string, SocketStatus>>({});
   /** Result of the last hotkey registration (OS-wide shortcuts, conflicts). */
   hotkeyStatus = $state<{ global: string[]; errors: string[] }>({ global: [], errors: [] });
   /** Settings dialog, opened from the user panel. */
-  settingsOpen = $state<null | 'voice' | 'keybinds'>(null);
+  settingsOpen = $state<null | 'voice' | 'keybinds' | 'sounds'>(null);
 
   /** WebAudio playback graph for the current call. Never reactive. */
   private mixer: AudioMixer | null = null;
@@ -199,6 +224,10 @@ class AppStore {
     return this.stickers[ck(serverId, spaceId)] ?? [];
   }
 
+  presenceOf(serverId: string, channelId: string): CallPresence | null {
+    return this.presence[ck(serverId, channelId)] ?? null;
+  }
+
   lockedOf(serverId: string, spaceId: string): boolean {
     return this.lockedSpaces[ck(serverId, spaceId)] === true;
   }
@@ -240,6 +269,7 @@ class AppStore {
   // ---------- lifecycle ----------
 
   async bootstrap() {
+    setSoundPrefs($state.snapshot(this.sounds));
     await migrateLegacyAccount();
     const vault = credentials.loadVault();
     if (vault.length === 0) {
@@ -373,6 +403,8 @@ class AppStore {
     for (const key of Object.keys(this.messages)) if (key.startsWith(serverId + '|')) delete this.messages[key];
     for (const key of Object.keys(this.stickers)) if (key.startsWith(serverId + '|')) delete this.stickers[key];
     for (const key of Object.keys(this.lockedSpaces)) if (key.startsWith(serverId + '|')) delete this.lockedSpaces[key];
+    this.clearPresence(serverId);
+    delete this.socketStatus[serverId];
     for (const key of [...this.stickerUrls.keys()]) {
       if (key.startsWith(serverId + '|')) {
         URL.revokeObjectURL(this.stickerUrls.get(key)!);
@@ -397,13 +429,38 @@ class AppStore {
   private connectSocket(conn: ServerConn) {
     if (!conn.api.token) return;
     conn.socket?.close();
-    conn.socket = new EventSocket(conn.serverUrl, conn.api.token);
-    conn.socket.onEvent((ev) => void this.handleEvent(conn.id, ev));
-    conn.socket.connect();
+    const socket = new EventSocket(conn.serverUrl, conn.api.token);
+    conn.socket = socket;
+    socket.onEvent((ev) => void this.handleEvent(conn.id, ev));
+    // The server sends a fresh presence snapshot right after (re)connecting;
+    // drop what we knew so calls that ended while we were away disappear.
+    socket.onOpen(() => this.clearPresence(conn.id));
+    socket.onStatus((st) => {
+      if (conn.socket !== socket) return;
+      this.socketStatus[conn.id] = st;
+      if (st.state === 'open') this.patchServer(conn.id, { status: 'online', error: null });
+      else if (st.state === 'reconnecting') this.patchServer(conn.id, { status: 'connecting', error: 'reconnecting…' });
+    });
+    socket.connect();
+  }
+
+  /** Reconnect-banner "Retry now". */
+  retryConnection(serverId: string) {
+    this.conn(serverId)?.socket?.retryNow();
+  }
+
+  private clearPresence(serverId: string) {
+    for (const key of Object.keys(this.presence)) if (key.startsWith(serverId + '|')) delete this.presence[key];
   }
 
   private async handleEvent(serverId: string, ev: ServerEvent) {
     switch (ev.type) {
+      case 'call_presence': {
+        const key = ck(serverId, ev.channel_id);
+        if (ev.participants.length === 0) delete this.presence[key];
+        else this.presence[key] = { participants: ev.participants, streaming: ev.streaming ?? [] };
+        break;
+      }
       case 'message_new': {
         const msg = await this.decryptWire(serverId, ev.channel_id, ev.message);
         const key = ck(serverId, ev.channel_id);
@@ -830,13 +887,33 @@ class AppStore {
           if (this.call) this.call.relay = relay;
         },
         onBroadcastChanged: (broadcasting) => {
-          if (this.call) this.call.broadcasting = broadcasting;
+          if (!this.call) return;
+          if (this.call.broadcasting !== broadcasting) (broadcasting ? playStreamStart : playStreamStop)();
+          this.call.broadcasting = broadcasting;
         },
         onPeerState: (userId, state) => {
-          if (this.call) this.call.peerStates[userId] = state;
+          if (!this.call) return;
+          const was = this.call.peerStates[userId]?.streaming ?? false;
+          this.call.peerStates[userId] = state;
+          if (state.streaming !== was) {
+            (state.streaming ? playStreamStart : playStreamStop)();
+            if (state.streaming && this.callPrefs.autoWatch) this.call.manager.setWatching(userId, true);
+          }
+        },
+        onPeerLink: (userId, link) => {
+          if (this.call) this.call.links[userId] = link;
+        },
+        onWatchingChanged: (watching) => {
+          if (this.call) this.call.watching = watching;
         },
         onPeerJoined: () => playJoin(),
-        onPeerLeft: () => playLeave(),
+        onPeerLeft: (userId) => {
+          playLeave();
+          if (this.call) {
+            delete this.call.peerStates[userId];
+            delete this.call.links[userId];
+          }
+        },
         onEnded: () => {
           this.call = null;
         },
@@ -856,9 +933,12 @@ class AppStore {
       broadcasting: false,
       broadcastStarting: false,
       peerStates: {},
+      links: {},
+      watching: [],
     };
     try {
       await manager.join(mic.stream, { muted: this.micMuted, deafened: this.deafened });
+      playJoin();
       void this.refreshDevices();
       this.speakingTimer = setInterval(() => this.pollSpeaking(), 100);
     } catch (e) {
@@ -869,6 +949,7 @@ class AppStore {
   }
 
   leaveCall() {
+    if (this.call) playLeave();
     this.call?.manager.leave();
     this.teardownAudio();
     this.call = null;
@@ -916,6 +997,7 @@ class AppStore {
     this.micMuted = !this.micMuted;
     // Unmuting means you want to talk — so you're no longer deafened either.
     if (!this.micMuted && this.deafened) this.deafened = false;
+    playToggle(!this.micMuted);
     this.announceSelf();
   }
 
@@ -928,6 +1010,7 @@ class AppStore {
     } else {
       this.micMuted = this.preDeafenMicMuted;
     }
+    playToggle(!this.deafened);
     this.announceSelf();
   }
 
@@ -964,6 +1047,21 @@ class AppStore {
     } catch (e) {
       this.error = `Could not switch audio output: ${e instanceof Error ? e.message : e}`;
     }
+  }
+
+  /** Start/stop watching someone's screen share. */
+  watch(userId: string, on: boolean) {
+    this.call?.manager.setWatching(userId, on);
+  }
+
+  saveSounds() {
+    const v = $state.snapshot(this.sounds);
+    setSoundPrefs(v);
+    prefs.saveSounds(v);
+  }
+
+  saveCallPrefs() {
+    prefs.saveCall($state.snapshot(this.callPrefs));
   }
 
   saveKeybinds() {

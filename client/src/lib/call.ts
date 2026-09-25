@@ -61,13 +61,20 @@ export interface PeerStats {
 export interface PeerState {
   muted: boolean;
   deafened: boolean;
+  /** Sharing their screen (others choose whether to watch). */
+  streaming: boolean;
 }
 
+/** Media connection health to one peer, for the UI. */
+export type PeerLink = 'connecting' | 'connected' | 'reconnecting' | 'failed';
+
 interface SignalPayload {
-  kind: 'sdp' | 'ice' | 'state';
+  kind: 'sdp' | 'ice' | 'state' | 'watch';
   description?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit | null;
   state?: PeerState;
+  /** kind 'watch': the sender wants (true) / no longer wants (false) our screen. */
+  watch?: boolean;
 }
 
 interface Peer {
@@ -119,8 +126,12 @@ export interface CallCallbacks {
   onEnded: () => void;
   /** Relay engine snapshot, once per second (relay tree, per-link state). */
   onRelayStats?: (stats: HubStats) => void;
-  /** A participant's mute/deafen state changed. */
+  /** A participant's mute/deafen/streaming state changed. */
   onPeerState?: (userId: string, state: PeerState) => void;
+  /** Media connection to a participant changed (ICE connecting/lost/back). */
+  onPeerLink?: (userId: string, link: PeerLink) => void;
+  /** Which broadcasts we're watching changed. */
+  onWatchingChanged?: (watching: string[]) => void;
 }
 
 /** Whether this webview can keep its own playback out of a system-audio capture. */
@@ -159,7 +170,13 @@ export class CallManager {
   /** Set by stopBroadcast/leave while a start is in flight: discard its capture. */
   private startCancelled = false;
   /** What we tell peers about our mic/deafen state. */
-  private selfState: PeerState = { muted: false, deafened: false };
+  private selfState: PeerState = { muted: false, deafened: false, streaming: false };
+  /** Peers who asked to watch our broadcast; only they get the screen tracks. */
+  private watchers = new Set<string>();
+  /** Broadcasters whose screen we chose to watch. */
+  private watching = new Set<string>();
+  /** Relayed streams currently announced (we decode only the watched ones). */
+  private relayStreams: StreamInfo[] = [];
   settings: BroadcastSettings = { ...DEFAULT_BROADCAST };
   /**
    * Whether our system-audio capture leaves out what this app plays (peers'
@@ -182,9 +199,9 @@ export class CallManager {
    * Join with an already-captured mic stream. The caller owns it (volume,
    * sensitivity, device switching — see lib/mic) and stops it after leave().
    */
-  async join(mic: MediaStream, state: PeerState): Promise<void> {
+  async join(mic: MediaStream, state: Omit<PeerState, 'streaming'>): Promise<void> {
     this.micStream = mic;
-    this.selfState = { ...state };
+    this.selfState = { ...state, streaming: false };
     this.relay = new RelayHub(
       {
         myId: this.myId,
@@ -210,9 +227,10 @@ export class CallManager {
     this.loadMonitor.start();
     this.unsubscribe = this.socket.onEvent((ev) => this.handleEvent(ev));
     // A reconnect drops us from the server-side roster; re-join on reopen.
-    this.reopenUnsub = this.socket.onOpen(() =>
-      this.socket.send({ type: 'call_join', channel_id: this.channelId }),
-    );
+    this.reopenUnsub = this.socket.onOpen(() => {
+      this.socket.send({ type: 'call_join', channel_id: this.channelId });
+      if (this.screenStream) this.sendStreaming(true);
+    });
     this.socket.send({ type: 'call_join', channel_id: this.channelId });
     this.joined = true;
     this.statsTimer = setInterval(() => void this.collectStats(), 1000);
@@ -245,9 +263,56 @@ export class CallManager {
   }
 
   /** Tell everyone in the call our mic/deafen state. */
-  setSelfState(state: PeerState): void {
-    this.selfState = { ...state };
+  setSelfState(state: Omit<PeerState, 'streaming'>): void {
+    this.selfState = { ...this.selfState, ...state };
+    this.announceState();
+  }
+
+  private announceState(): void {
     for (const id of this.peers.keys()) this.sendSignal(id, { kind: 'state', state: this.selfState });
+  }
+
+  /** Server-side LIVE flag, so people outside the call see who's streaming. */
+  private sendStreaming(streaming: boolean): void {
+    this.socket.send({ type: 'call_streaming', channel_id: this.channelId, streaming });
+  }
+
+  /**
+   * Start/stop watching someone's broadcast. Screens are opt-in (like
+   * Discord's "Watch stream"): a broadcaster only sends video — and encodes
+   * it — for the people who asked, which saves everyone else's bandwidth.
+   */
+  setWatching(broadcasterId: string, on: boolean): void {
+    if (on === this.watching.has(broadcasterId)) return;
+    if (on) this.watching.add(broadcasterId);
+    else this.watching.delete(broadcasterId);
+    if (this.peers.has(broadcasterId)) this.sendSignal(broadcasterId, { kind: 'watch', watch: on });
+    if (!on) this.relay?.unwatch(broadcasterId);
+    this.syncRelayDecoders();
+    this.emitStreams(broadcasterId);
+    this.cb.onWatchingChanged?.([...this.watching]);
+  }
+
+  /** How many people are watching our broadcast. */
+  get viewerCount(): number {
+    return this.watchers.size;
+  }
+
+  isWatching(broadcasterId: string): boolean {
+    return this.watching.has(broadcasterId);
+  }
+
+  /** A viewer asked for (or dropped) our screen. */
+  private onWatchRequest(viewerId: string, on: boolean): void {
+    const peer = this.peers.get(viewerId);
+    if (on) {
+      if (this.watchers.has(viewerId)) return;
+      this.watchers.add(viewerId);
+      if (peer && this.meshBroadcast) this.addStreamTracks(peer, this.meshBroadcast);
+    } else {
+      if (!this.watchers.delete(viewerId)) return;
+      if (peer && this.meshBroadcast) this.removeStreamTracks(peer, this.meshBroadcast);
+    }
   }
 
   get isBroadcasting(): boolean {
@@ -338,9 +403,11 @@ export class CallManager {
         this.relayEncoder = null;
       }
     }
-    if (this.meshBroadcast) {
-      for (const peer of this.peers.values()) this.addStreamTracks(peer, this.meshBroadcast);
-    }
+    // Only viewers who asked get the screen; tell everyone it's available.
+    this.watchers.clear();
+    this.selfState = { ...this.selfState, streaming: true };
+    this.announceState();
+    this.sendStreaming(true);
     await this.applySenderSettings();
     this.cb.onBroadcastChanged(true);
   }
@@ -376,14 +443,12 @@ export class CallManager {
       this.relayEncoder = null;
       this.relay?.stopBroadcast();
     }
-    for (const peer of this.peers.values()) {
-      for (const sender of peer.pc.getSenders()) {
-        if (sender.track && stream.getTracks().includes(sender.track)) {
-          peer.pc.removeTrack(sender); // fires negotiationneeded
-        }
-      }
-    }
+    for (const peer of this.peers.values()) this.removeStreamTracks(peer, stream);
     this.stopTracks(stream);
+    this.watchers.clear();
+    this.selfState = { ...this.selfState, streaming: false };
+    this.announceState();
+    if (this.joined) this.sendStreaming(false);
     this.cb.onBroadcastChanged(false);
   }
 
@@ -475,6 +540,13 @@ export class CallManager {
   }
 
   private onRelayStreams(list: StreamInfo[]): void {
+    this.relayStreams = list;
+    this.syncRelayDecoders();
+  }
+
+  /** Decode exactly the announced relayed streams we chose to watch. */
+  private syncRelayDecoders(): void {
+    const list = this.relayStreams.filter((s) => this.watching.has(s.broadcasterId));
     const live = new Map(list.map((s) => [s.broadcasterId, s]));
     for (const [id, d] of this.relayDecoders) {
       const s = live.get(id);
@@ -493,7 +565,6 @@ export class CallManager {
         console.warn('cannot decode relayed stream', e);
         continue;
       }
-      // Everyone watches, as with the mesh today (opt-in watching can come later).
       this.relay?.watch(s.broadcasterId);
       this.emitStreams(s.broadcasterId);
     }
@@ -535,31 +606,33 @@ export class CallManager {
           }
         }
         // Drop peers no longer present.
-        for (const [id, peer] of this.peers) {
-          if (!ev.participants.includes(id)) {
-            this.relay?.detachPeer(id);
-            peer.pc.close();
-            this.peers.delete(id);
-            this.cb.onRemoteStreams(id, []);
-          }
+        for (const id of [...this.peers.keys()]) {
+          if (!ev.participants.includes(id)) this.dropPeer(id);
         }
         this.cb.onPeersChanged(ev.participants);
         break;
       }
-      case 'call_peer_left': {
-        const peer = this.peers.get(ev.user_id);
-        if (peer) {
-          this.relay?.detachPeer(ev.user_id);
-          peer.pc.close();
-          this.peers.delete(ev.user_id);
-          this.cb.onRemoteStreams(ev.user_id, []);
-        }
+      case 'call_peer_left':
+        this.dropPeer(ev.user_id);
         break;
-      }
       case 'signal':
         void this.handleSignal(ev.from, ev.payload as SignalPayload, ev.sig);
         break;
     }
+  }
+
+  private dropPeer(id: string) {
+    const peer = this.peers.get(id);
+    if (!peer) return;
+    this.relay?.detachPeer(id);
+    peer.pc.close();
+    this.peers.delete(id);
+    this.watchers.delete(id);
+    if (this.watching.delete(id)) {
+      this.syncRelayDecoders();
+      this.cb.onWatchingChanged?.([...this.watching]);
+    }
+    this.cb.onRemoteStreams(id, []);
   }
 
   private createPeer(userId: string): Peer {
@@ -575,7 +648,7 @@ export class CallManager {
     this.peers.set(userId, peer);
 
     if (this.micStream) this.addStreamTracks(peer, this.micStream);
-    if (this.meshBroadcast) this.addStreamTracks(peer, this.meshBroadcast);
+    // (A new peer isn't watching our screen yet; they'll ask with a 'watch' signal.)
     // Let them know whether we're muted (they may have joined after we muted).
     queueMicrotask(() => {
       if (this.peers.get(userId) === peer) this.sendSignal(userId, { kind: 'state', state: this.selfState });
@@ -614,11 +687,22 @@ export class CallManager {
       track.addEventListener('ended', refresh);
       refresh();
     };
+    let everConnected = false;
+    this.cb.onPeerLink?.(userId, 'connecting');
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed') {
+      const st = pc.connectionState;
+      if (st === 'connected') everConnected = true;
+      if (st === 'failed') {
         // ICE restart; perfect negotiation handles the rest.
         pc.restartIce();
       }
+      if (this.peers.get(userId) !== peer) return;
+      const link: PeerLink =
+        st === 'connected' ? 'connected'
+        : st === 'failed' ? (everConnected ? 'reconnecting' : 'failed')
+        : st === 'disconnected' ? 'reconnecting'
+        : everConnected ? 'reconnecting' : 'connecting';
+      if (st !== 'closed') this.cb.onPeerLink?.(userId, link);
     };
     return peer;
   }
@@ -632,10 +716,20 @@ export class CallManager {
   }
 
   private addStreamTracks(peer: Peer, stream: MediaStream) {
+    const sending = new Set(peer.pc.getSenders().map((s) => s.track));
     for (const track of stream.getTracks()) {
-      peer.pc.addTrack(track, stream);
+      if (!sending.has(track)) peer.pc.addTrack(track, stream);
     }
     if (stream === this.screenStream) void this.applySenderSettings();
+  }
+
+  private removeStreamTracks(peer: Peer, stream: MediaStream) {
+    const tracks = stream.getTracks();
+    for (const sender of peer.pc.getSenders()) {
+      if (sender.track && tracks.includes(sender.track)) {
+        peer.pc.removeTrack(sender); // fires negotiationneeded
+      }
+    }
   }
 
   private sendSignal(to: string, payload: SignalPayload) {
@@ -670,10 +764,16 @@ export class CallManager {
           this.sendSignal(from, { kind: 'sdp', description: pc.localDescription!.toJSON() });
         }
       } else if (payload.kind === 'state' && payload.state) {
-        this.cb.onPeerState?.(from, {
+        const state: PeerState = {
           muted: payload.state.muted === true,
           deafened: payload.state.deafened === true,
-        });
+          streaming: payload.state.streaming === true,
+        };
+        // Their broadcast ended: we're no longer watching it (a new one is opt-in again).
+        if (!state.streaming && this.watching.has(from)) this.setWatching(from, false);
+        this.cb.onPeerState?.(from, state);
+      } else if (payload.kind === 'watch') {
+        this.onWatchRequest(from, payload.watch === true);
       } else if (payload.kind === 'ice') {
         try {
           await pc.addIceCandidate(payload.candidate ?? undefined);

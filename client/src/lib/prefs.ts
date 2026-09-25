@@ -5,6 +5,7 @@
  */
 import type { GateSettings } from './gate';
 import { defaultBinding } from './keybinds';
+import { DEFAULT_SOUNDS, type SoundPrefs } from './sounds';
 
 export interface VoicePrefs {
   /** Mic device ('' = system default). */
@@ -49,6 +50,13 @@ const K_VOICE = 'malguem.voice';
 const K_KEYS = 'malguem.keybinds';
 const K_VOLUMES = 'malguem.userVolumes';
 const K_SELF = 'malguem.selfState';
+const K_SOUNDS = 'malguem.sounds';
+const K_CALL = 'malguem.callPrefs';
+
+export interface CallPrefs {
+  /** Start watching screen shares as soon as they begin (off = click to watch). */
+  autoWatch: boolean;
+}
 
 function read<T extends object>(key: string, fallback: T): T {
   try {
@@ -98,6 +106,10 @@ export const prefs = {
     return v;
   },
   saveVolumes: (v: Record<string, number>) => write(K_VOLUMES, v),
+  loadSounds: (): SoundPrefs => read(K_SOUNDS, DEFAULT_SOUNDS),
+  saveSounds: (v: SoundPrefs) => write(K_SOUNDS, v),
+  loadCall: (): CallPrefs => read(K_CALL, { autoWatch: false }),
+  saveCall: (v: CallPrefs) => write(K_CALL, v),
   loadSelf: (): { micMuted: boolean; deafened: boolean } =>
     read(K_SELF, { micMuted: false, deafened: false }),
   saveSelf: (v: { micMuted: boolean; deafened: boolean }) => write(K_SELF, v),

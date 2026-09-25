@@ -25,6 +25,7 @@
   const inThisCall = $derived(store.call?.serverId === serverId && store.call?.channelId === channelId);
   const locked = $derived(store.lockedOf(serverId, space.id));
   const isOwner = $derived(space.owner_id === store.userIdOf(serverId));
+  const presence = $derived(store.presenceOf(serverId, channelId));
 
   // ---- scrolling ----
   // Follow new messages only while the reader is at the bottom; if they've
@@ -170,9 +171,23 @@
   <header>
     <span class="title"># {channel?.name}</span>
     {#if !inThisCall}
-      <button class="primary" onclick={() => store.joinCall(serverId, channelId)} disabled={store.call !== null}>
-        Join call
-      </button>
+      <div class="join">
+        {#if presence}
+          <span class="in-call" title={presence.participants.map((p) => store.memberName(serverId, space.id, p)).join(', ')}>
+            {#each presence.participants.slice(0, 4) as p (p)}
+              <span class="mini">{store.memberName(serverId, space.id, p).slice(0, 1).toUpperCase()}</span>
+            {/each}
+            {presence.participants.length} in call{presence.streaming.length ? ' · LIVE' : ''}
+          </span>
+        {/if}
+        <button
+          class="primary"
+          onclick={() => store.joinCall(serverId, channelId)}
+          title={store.call ? 'Leaves your current call' : ''}
+        >
+          {store.call ? 'Switch to this call' : 'Join call'}
+        </button>
+      </div>
     {/if}
   </header>
 
@@ -262,6 +277,22 @@
     border-bottom: 1px solid var(--bg-3);
   }
   .title { font-weight: 600; }
+  .join { display: flex; align-items: center; gap: 10px; }
+  .in-call { display: flex; align-items: center; gap: 2px; color: var(--ok); font-size: 12.5px; }
+  .in-call .mini {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--bg-3);
+    color: var(--fg-0);
+    display: grid;
+    place-items: center;
+    font-size: 10px;
+    font-weight: 700;
+    margin-right: -4px;
+    box-shadow: 0 0 0 2px var(--bg-2);
+  }
+  .in-call .mini:last-of-type { margin-right: 6px; }
 
   .messages { flex: 1 1 0; min-height: 120px; overflow-y: auto; overflow-anchor: none; padding: 12px 16px; }
   .content { display: flex; flex-direction: column; gap: 8px; }

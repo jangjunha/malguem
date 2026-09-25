@@ -108,11 +108,23 @@
     return userId === call?.selfId ? store.deafened : call?.peerStates[userId]?.deafened === true;
   }
 
-  const hasTiles = $derived(
-    !!call &&
-      ((call.broadcasting && !!call.manager.localScreen) ||
-        Object.values(call.remoteStreams).some((list) => list.some(hasVideo))),
-  );
+  /**
+   * Remote screens to show: everyone who's live (watched or not), plus any
+   * video that arrives from a peer that doesn't announce streaming.
+   */
+  const screens = $derived.by(() => {
+    if (!call) return [];
+    const ids = new Set<string>();
+    for (const [id, st] of Object.entries(call.peerStates)) if (st.streaming && call.participants.includes(id)) ids.add(id);
+    for (const [id, list] of Object.entries(call.remoteStreams)) if (list.some(hasVideo)) ids.add(id);
+    return [...ids].map((userId) => ({
+      userId,
+      videos: (call.remoteStreams[userId] ?? []).filter(hasVideo),
+      watching: call.watching.includes(userId),
+    }));
+  });
+
+  const hasTiles = $derived(!!call && ((call.broadcasting && !!call.manager.localScreen) || screens.length > 0));
 
   /** Sharing system audio without a way to keep our own playback out of it. */
   const loopbackRisk = $derived(
@@ -123,11 +135,14 @@
       call.participants.length > 1,
   );
 
+  /** Viewers of our mesh broadcast (re-read with the 1 Hz stats tick). */
+  const viewers = $derived(call ? (call.stats, call.manager.viewerCount) : 0);
+
   const uploadEstimate = $derived(
     call && call.broadcasting
       ? call.relay?.outgoing
         ? (s.maxBitrateKbps * Math.max(1, Object.values(call.relay.outgoing.tree).filter((p) => p === call.selfId).length)) / 1000
-        : (s.maxBitrateKbps * Math.max(call.participants.length - 1, 1)) / 1000
+        : (s.maxBitrateKbps * Math.max(viewers, 1)) / 1000
       : 0,
   );
 </script>
@@ -145,18 +160,39 @@
           <figcaption><b>You</b> (preview) · {localLine()}</figcaption>
         </figure>
       {/if}
-      {#each Object.entries(call.remoteStreams) as [userId, streams] (userId)}
-        {#each streams as stream (stream.id)}
-          {#if hasVideo(stream)}
+      {#each screens as sc (sc.userId)}
+        {#if sc.videos.length > 0}
+          {#each sc.videos as stream (stream.id)}
             <figure class="tile" class:spotlight={spotlightId === stream.id} class:dimmed={spotlightId != null && spotlightId !== stream.id}>
               <!-- svelte-ignore a11y_media_has_caption -->
               <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
               <!-- Muted: this peer's audio is played (and volume-controlled) by the mixer. -->
               <video autoplay playsinline use:srcObject={stream} onclick={() => toggleSpotlight(stream.id)} ondblclick={(e) => toggleFullscreen(e.currentTarget)} title={(spotlightId === stream.id ? 'Click to shrink' : 'Click to enlarge') + ' · Double-click for fullscreen'}></video>
-              <figcaption><b>{name(userId)}</b> · {statLine(userId)}</figcaption>
+              <figcaption>
+                <b>{name(sc.userId)}</b> · {statLine(sc.userId)}
+                {#if sc.watching}
+                  <button class="cap-btn" onclick={() => store.watch(sc.userId, false)}>Stop watching</button>
+                {/if}
+              </figcaption>
             </figure>
-          {/if}
-        {/each}
+          {/each}
+        {:else}
+          <!-- Live but not (yet) watched: opt in, like Discord's "Watch stream". -->
+          <div class="tile live-card" class:dimmed={spotlightId != null}>
+            <div class="live-inner">
+              <span class="live-badge">LIVE</span>
+              <span class="live-name">{name(sc.userId)} is sharing their screen</span>
+              {#if sc.watching}
+                <span class="live-sub">Connecting to stream…</span>
+                <button onclick={() => store.watch(sc.userId, false)}>Cancel</button>
+              {:else}
+                <button class="primary" onclick={() => store.watch(sc.userId, true)}>
+                  <Icon name="screen" size={16} /> Watch stream
+                </button>
+              {/if}
+            </div>
+          </div>
+        {/if}
       {/each}
     </div>
     {/if}
@@ -182,6 +218,12 @@
             <span class="pname">{name(p)}{self ? ' (you)' : ''}</span>
             {#if isMuted(p)}<span class="state" title="Muted"><Icon name="mic-off" size={14} /></span>{/if}
             {#if isDeafened(p)}<span class="state" title="Deafened"><Icon name="headphones-off" size={14} /></span>{/if}
+            {#if (self ? call.broadcasting : call.peerStates[p]?.streaming)}<span class="live-tag">LIVE</span>{/if}
+            {#if !self && call.links[p] && call.links[p] !== 'connected'}
+              <span class="link-state" class:bad={call.links[p] === 'failed'}>
+                {call.links[p] === 'connecting' ? 'connecting…' : call.links[p] === 'reconnecting' ? 'reconnecting…' : 'no connection'}
+              </span>
+            {/if}
             {#if !self && volumePct(p) !== 100}<span class="vol-badge">{volumePct(p)}%</span>{/if}
           </button>
           {#if volumeFor === p && !self}
@@ -190,6 +232,10 @@
         </div>
       {/each}
     </div>
+
+    {#if store.socketStatus[call.serverId]?.state === 'reconnecting'}
+      <p class="notice">Server connection lost — people already connected can still hear you. Reconnecting…</p>
+    {/if}
 
     {#if loopbackRisk}
       <p class="warn">
@@ -298,7 +344,7 @@
           </select>
         </label>
         {#if uploadEstimate > 0}
-          <span class="estimate">≈{uploadEstimate.toFixed(0)} Mb/s upload ({call.relay?.outgoing ? 'relay tree' : `${call.participants.length - 1} viewer${call.participants.length === 2 ? '' : 's'}`})</span>
+          <span class="estimate">≈{uploadEstimate.toFixed(0)} Mb/s upload ({call.relay?.outgoing ? 'relay tree' : `${viewers} watching`})</span>
         {/if}
         {#if s.frameRate === 60}
           <p class="hint">
@@ -319,7 +365,10 @@
 
 <style>
   .panel {
-    flex: none;
+    /* Never push the chat composer off-screen: the video area shrinks first. */
+    flex: 0 1 auto;
+    min-height: 0;
+    max-height: calc(100% - 170px);
     border-bottom: 1px solid var(--bg-3);
     background: var(--bg-1);
     padding: 12px 16px 10px;
@@ -393,8 +442,11 @@
   }
   .settings label.check { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; align-self: center; }
   .estimate { color: var(--fg-1); font-size: 12px; margin-left: auto; align-self: center; }
+  /* Column children keep their natural height (a flex-basis here would be a height). */
+  .panel > * { flex-shrink: 0; }
+  .panel > .tiles { flex-shrink: 1; min-height: 90px; }
+  .settings .hint { flex-basis: 100%; }
   .hint, .warn {
-    flex-basis: 100%;
     margin: 0;
     color: var(--fg-1);
     font-size: 11.5px;
@@ -446,4 +498,38 @@
   .tile.dimmed { flex: 0 0 200px; max-width: 200px; }
   figcaption { font-size: 11.5px; color: var(--fg-1); margin-top: 2px; }
   figcaption b { color: var(--fg-0); }
+  .cap-btn { float: right; background: transparent; color: var(--fg-1); font-size: 11.5px; padding: 0 2px; }
+  .cap-btn:hover { color: var(--fg-0); text-decoration: underline; }
+
+  .live-card {
+    aspect-ratio: 16 / 9;
+    max-width: 420px;
+    border-radius: var(--radius);
+    background: linear-gradient(135deg, var(--bg-3), var(--bg-0));
+    display: grid;
+    place-items: center;
+  }
+  .live-card.dimmed { aspect-ratio: auto; }
+  .live-inner { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px; text-align: center; }
+  .live-inner button { display: inline-flex; align-items: center; gap: 6px; }
+  .live-badge, .live-tag {
+    background: var(--danger);
+    color: #0d1117;
+    font-weight: 700;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 11px;
+  }
+  .live-tag { font-size: 9.5px; padding: 0 4px; }
+  .live-name { font-weight: 600; }
+  .live-sub { color: var(--fg-1); font-size: 12px; }
+  .link-state { color: #d29922; font-size: 11px; }
+  .link-state.bad { color: var(--danger); }
+  .notice {
+    margin: 0;
+    font-size: 12px;
+    background: color-mix(in srgb, #d29922 18%, transparent);
+    border-radius: var(--radius);
+    padding: 6px 10px;
+  }
 </style>
