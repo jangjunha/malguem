@@ -1,0 +1,16 @@
+{
+  "name": "malguem-relay-sim",
+  "private": true,
+  "type": "module",
+  "description": "Network-emulated simulation of the relayed screen-broadcast engine (client/src/lib/relay).",
+  "scripts": {
+    "build": "esbuild page/main.ts --bundle --format=esm --target=es2022 --outfile=dist/page.js",
+    "sim": "npm run build && node --experimental-strip-types harness.ts",
+    "smoke": "esbuild smoke/page.ts --bundle --format=esm --target=es2022 --outfile=dist/smoke.js && node --experimental-strip-types smoke/run.ts",
+    "report": "python3 report.py > results/tables.md"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "playwright-core": "1.56.1"
+  }
+}

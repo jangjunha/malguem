@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio_loopback;
+mod game_detect;
 mod keychain;
 mod webview_permissions;
 
@@ -16,6 +17,7 @@ fn main() {
             keychain::keychain_get,
             keychain::keychain_set,
             keychain::keychain_delete,
+            game_detect::fullscreen_app_active,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
