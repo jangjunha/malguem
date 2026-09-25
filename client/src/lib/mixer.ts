@@ -27,6 +27,18 @@ interface PeerSource {
   userId: string;
 }
 
+/** Level above which a peer's voice counts as speaking, dBFS. */
+const SPEAKING_DB = -50;
+/** Keep the speaking ring lit this long after the last loud sample. */
+const SPEAKING_HOLD_MS = 300;
+
+interface VoiceMeter {
+  streamId: string;
+  analyser: AnalyserNode;
+  buf: Float32Array<ArrayBuffer>;
+  lastLoud: number;
+}
+
 /** AudioContext gained an output-device API later than the DOM lib types. */
 type SinkContext = AudioContext & { setSinkId?: (id: string) => Promise<void> };
 
@@ -39,6 +51,8 @@ export class AudioMixer {
   private volumes = new Map<string, number>();
   /** streamId → live source + keepalive element. */
   private sources = new Map<string, PeerSource>();
+  /** userId → analyser on their voice stream (for the speaking indicator). */
+  private meters = new Map<string, VoiceMeter>();
 
   constructor() {
     this.ctx = new AudioContext();
@@ -78,6 +92,19 @@ export class AudioMixer {
       el.muted = true; // workaround only — the Web Audio graph is the audible path
       void el.play().catch(() => {});
       this.sources.set(stream.id, { source, el, userId });
+      // A peer's voice stream is the first audio-only stream they send (mic
+      // tracks are added when the connection is created, before any share).
+      if (!this.meters.has(userId) && stream.getVideoTracks().length === 0) {
+        const analyser = this.ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        source.connect(analyser);
+        this.meters.set(userId, {
+          streamId: stream.id,
+          analyser,
+          buf: new Float32Array(analyser.fftSize),
+          lastLoud: 0,
+        });
+      }
     }
     for (const [id, src] of this.sources) {
       if (src.userId === userId && !wanted.has(id)) this.removeSource(id);
@@ -88,6 +115,8 @@ export class AudioMixer {
     const src = this.sources.get(streamId);
     if (!src) return;
     src.source.disconnect();
+    const meter = this.meters.get(src.userId);
+    if (meter?.streamId === streamId) this.meters.delete(src.userId);
     src.el.pause();
     src.el.srcObject = null;
     this.sources.delete(streamId);
@@ -101,6 +130,21 @@ export class AudioMixer {
 
   getVolume(userId: string): number {
     return this.volumes.get(userId) ?? 1;
+  }
+
+  /** Peers whose voice is currently audible (polled by the UI, ~10×/s). */
+  speaking(): Set<string> {
+    const now = performance.now();
+    const out = new Set<string>();
+    for (const [userId, m] of this.meters) {
+      m.analyser.getFloatTimeDomainData(m.buf);
+      let sum = 0;
+      for (const v of m.buf) sum += v * v;
+      const db = 10 * Math.log10(sum / m.buf.length || 1e-10);
+      if (db > SPEAKING_DB) m.lastLoud = now;
+      if (now - m.lastLoud < SPEAKING_HOLD_MS) out.add(userId);
+    }
+    return out;
   }
 
   setDeafened(deafened: boolean): void {

@@ -2,12 +2,32 @@
   import { onMount } from 'svelte';
   import Main from './components/Main.svelte';
   import Onboarding from './components/Onboarding.svelte';
+  import SettingsModal from './components/SettingsModal.svelte';
+  import { Hotkeys } from './lib/hotkeys';
   import { store } from './lib/store.svelte';
+
+  const hotkeys = new Hotkeys((action) => {
+    if (action === 'toggleMute') store.toggleMic();
+    else store.toggleDeafen();
+  });
 
   onMount(() => {
     void store.bootstrap();
+    return () => void hotkeys.dispose();
+  });
+
+  // Re-register whenever a binding or the global toggle changes. OS-wide only
+  // while in a call: outside one, Ctrl+Shift+M/D stay with other apps.
+  const inCall = $derived(store.call !== null);
+  $effect(() => {
+    const binds = $state.snapshot(store.keybinds);
+    void hotkeys
+      .sync({ ...binds, global: binds.global && inCall })
+      .then((status) => (store.hotkeyStatus = status));
   });
 </script>
+
+<svelte:window onkeydown={(e) => hotkeys.onKeydown(e)} />
 
 {#if store.phase === 'loading'}
   <div class="center">connecting…</div>
@@ -15,6 +35,10 @@
   <Onboarding />
 {:else}
   <Main />
+{/if}
+
+{#if store.settingsOpen}
+  <SettingsModal />
 {/if}
 
 {#if store.error}

@@ -13,6 +13,8 @@ fn main() {
         // fetch OpenGraph metadata client-side (no CORS, server stays blind).
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_http::init())
+        // Mute/deafen hotkeys that fire while a fullscreen game has focus.
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             keychain::keychain_get,
             keychain::keychain_set,

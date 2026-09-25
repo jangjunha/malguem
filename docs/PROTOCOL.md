@@ -125,6 +125,11 @@ space and the recipient is online; it never inspects it.
 - Voice and screen-share travel over the same peer connections; screen share
   is an extra video (+ audio) track added by the broadcaster with sender-side
   codec/bitrate/resolution/fps settings applied locally.
+- `signal` payloads are opaque to the server. Clients send `{"kind": "sdp", …}`
+  and `{"kind": "ice", …}` for negotiation, and
+  `{"kind": "state", "state": {"muted": bool, "deafened": bool}}` to show
+  their mic/deafen state to each peer (sent on connect and on every change).
+  Clients ignore kinds they don't know.
 
 ## Versioning
 

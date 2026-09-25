@@ -26,10 +26,58 @@
   const locked = $derived(store.lockedOf(serverId, space.id));
   const isOwner = $derived(space.owner_id === store.userIdOf(serverId));
 
-  // Keep scrolled to the bottom as messages arrive.
+  // ---- scrolling ----
+  // Follow new messages only while the reader is at the bottom; if they've
+  // scrolled up to read history, leave them there and offer a jump button.
+  // Content that grows after render (images, link cards, stickers) and the
+  // call panel resizing the viewport both keep a pinned view pinned.
+  let content = $state<HTMLElement | null>(null);
+  let pinned = $state(true);
+  let unseen = $state(0);
+  const PIN_SLACK_PX = 48;
+
+  function scrollToBottom() {
+    if (!scroller) return;
+    scroller.scrollTop = scroller.scrollHeight;
+    pinned = true;
+    unseen = 0;
+  }
+
+  function onScroll() {
+    if (!scroller) return;
+    pinned = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= PIN_SLACK_PX;
+    if (pinned) unseen = 0;
+  }
+
+  // New channel: start at its latest message.
+  let shownChannel = '';
+  let shownCount = 0;
   $effect(() => {
-    msgs.length;
-    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    const count = msgs.length;
+    const key = `${serverId}|${channelId}`;
+    if (!scroller) return;
+    if (key !== shownChannel) {
+      shownChannel = key;
+      shownCount = count;
+      scrollToBottom();
+      return;
+    }
+    const added = count - shownCount;
+    shownCount = count;
+    if (added <= 0) return;
+    const mine = msgs[count - 1]?.senderId === store.userIdOf(serverId);
+    if (pinned || mine) scrollToBottom();
+    else unseen += added;
+  });
+
+  $effect(() => {
+    if (!scroller || !content) return;
+    const ro = new ResizeObserver(() => {
+      if (pinned && scroller) scroller.scrollTop = scroller.scrollHeight;
+    });
+    ro.observe(scroller);
+    ro.observe(content);
+    return () => ro.disconnect();
   });
 
   /** Recompute the emoji menu from the `:token` immediately before the caret. */
@@ -132,7 +180,8 @@
     <CallPanel />
   {/if}
 
-  <div class="messages" bind:this={scroller}>
+  <div class="messages" bind:this={scroller} onscroll={onScroll}>
+    <div class="content" bind:this={content}>
     {#if locked}
       <div class="locked">
         Waiting for another member to share this space's encryption key…
@@ -150,9 +199,15 @@
         </div>
       </div>
     {/each}
+    </div>
   </div>
 
   <div class="composer">
+    {#if !pinned && unseen > 0}
+      <button class="jump" onclick={scrollToBottom}>
+        {unseen} new message{unseen === 1 ? '' : 's'} — jump to latest ↓
+      </button>
+    {/if}
     {#if showStickers}
       <StickerPicker
         {serverId}
@@ -198,7 +253,7 @@
 </div>
 
 <style>
-  .view { display: flex; flex-direction: column; height: 100%; }
+  .view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
   header {
     display: flex;
     align-items: center;
@@ -208,7 +263,22 @@
   }
   .title { font-weight: 600; }
 
-  .messages { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .messages { flex: 1 1 0; min-height: 120px; overflow-y: auto; overflow-anchor: none; padding: 12px 16px; }
+  .content { display: flex; flex-direction: column; gap: 8px; }
+  .jump {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 15;
+    background: var(--accent);
+    color: #0d1117;
+    font-weight: 600;
+    font-size: 12.5px;
+    border-radius: 999px;
+    padding: 5px 14px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  }
   .msg { display: flex; flex-direction: column; }
   .msg .meta { color: var(--fg-1); font-size: 12px; }
   .msg .meta b { color: var(--fg-0); }

@@ -1,6 +1,9 @@
 <script lang="ts">
+  import Icon from './Icon.svelte';
+  import VolumePopover from './VolumePopover.svelte';
+  import { canRestrictOwnAudio } from '../lib/call';
+  import { formatAccelerator } from '../lib/keybinds';
   import { store } from '../lib/store.svelte';
-  import { MAX_GAIN } from '../lib/mixer';
 
   let showSettings = $state(false);
   /** Stream id currently shown large; null = grid view. */
@@ -13,28 +16,6 @@
 
   function toggleSpotlight(id: string) {
     spotlightId = spotlightId === id ? null : id;
-  }
-
-  /** Discord-style call shortcuts, active only while a call is up. */
-  function onWindowKeydown(e: KeyboardEvent) {
-    if (!store.call) return;
-    const t = e.target as HTMLElement | null;
-    const typing =
-      !!t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName));
-    if (e.key === 'Escape' && volumeFor) {
-      volumeFor = null;
-      return;
-    }
-    if (typing) return;
-    // `code` is keyboard-layout independent (KeyM stays KeyM under Shift).
-    const mod = e.ctrlKey || e.metaKey;
-    if (mod && e.shiftKey && e.code === 'KeyM') {
-      e.preventDefault();
-      store.toggleMic();
-    } else if (mod && e.shiftKey && e.code === 'KeyD') {
-      e.preventDefault();
-      store.toggleDeafen();
-    }
   }
 
   function volumePct(userId: string): number {
@@ -112,6 +93,36 @@
     return parts.join(' · ');
   }
 
+  /** Local preview caption: what the capture really delivers + our send stats. */
+  function localLine(): string {
+    const cap = call?.manager.captureSettings();
+    const capture = cap ? `capture ${cap.width}×${cap.height} @ ${cap.frameRate}fps` : '';
+    const send = relayOutLine() || statLine(call?.participants.find((p) => p !== call?.selfId) ?? '');
+    return [capture, send].filter(Boolean).join(' · ');
+  }
+
+  function isMuted(userId: string): boolean {
+    return userId === call?.selfId ? store.micMuted : call?.peerStates[userId]?.muted === true;
+  }
+  function isDeafened(userId: string): boolean {
+    return userId === call?.selfId ? store.deafened : call?.peerStates[userId]?.deafened === true;
+  }
+
+  const hasTiles = $derived(
+    !!call &&
+      ((call.broadcasting && !!call.manager.localScreen) ||
+        Object.values(call.remoteStreams).some((list) => list.some(hasVideo))),
+  );
+
+  /** Sharing system audio without a way to keep our own playback out of it. */
+  const loopbackRisk = $derived(
+    !!call &&
+      call.broadcasting &&
+      s.systemAudio &&
+      call.manager.ownAudioExcluded === false &&
+      call.participants.length > 1,
+  );
+
   const uploadEstimate = $derived(
     call && call.broadcasting
       ? call.relay?.outgoing
@@ -121,64 +132,115 @@
   );
 </script>
 
-<svelte:window onkeydown={onWindowKeydown} />
-
 {#if call}
   <section class="panel">
-    <div class="row controls">
-      <div class="participants">
-        {#each call.participants as p (p)}
-          {#if p === call.selfId}
-            <span class="chip me">{name(p)}</span>
-          {:else}
-            <div class="chip-wrap">
-              <button
-                class="chip"
-                class:adjusted={volumePct(p) !== 100}
-                title="Adjust {name(p)}'s volume"
-                onclick={() => (volumeFor = volumeFor === p ? null : p)}
-              >
-                {name(p)}{#if volumePct(p) !== 100}<span class="vol-badge">{volumePct(p)}%</span>{/if}
-              </button>
-              {#if volumeFor === p}
-                <div class="vol-pop">
-                  <input
-                    type="range"
-                    min="0"
-                    max={MAX_GAIN * 100}
-                    step="5"
-                    value={volumePct(p)}
-                    oninput={(e) => store.setPeerVolume(p, e.currentTarget.valueAsNumber / 100)}
-                    aria-label="{name(p)} volume"
-                  />
-                  <span class="vol-num">{volumePct(p)}%</span>
-                </div>
-              {/if}
-            </div>
+    {#if hasTiles}
+    <div class="tiles" class:has-spotlight={spotlightId != null}>
+      {#if call.broadcasting && call.manager.localScreen}
+        {@const id = `local:${call.manager.localScreen.id}`}
+        <figure class="tile local" class:spotlight={spotlightId === id} class:dimmed={spotlightId != null && spotlightId !== id}>
+          <!-- svelte-ignore a11y_media_has_caption -->
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          <video autoplay playsinline muted use:srcObject={call.manager.localScreen} onclick={() => toggleSpotlight(id)} ondblclick={(e) => toggleFullscreen(e.currentTarget)} title={(spotlightId === id ? 'Click to shrink' : 'Click to enlarge') + ' · Double-click for fullscreen'}></video>
+          <figcaption><b>You</b> (preview) · {localLine()}</figcaption>
+        </figure>
+      {/if}
+      {#each Object.entries(call.remoteStreams) as [userId, streams] (userId)}
+        {#each streams as stream (stream.id)}
+          {#if hasVideo(stream)}
+            <figure class="tile" class:spotlight={spotlightId === stream.id} class:dimmed={spotlightId != null && spotlightId !== stream.id}>
+              <!-- svelte-ignore a11y_media_has_caption -->
+              <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+              <!-- Muted: this peer's audio is played (and volume-controlled) by the mixer. -->
+              <video autoplay playsinline use:srcObject={stream} onclick={() => toggleSpotlight(stream.id)} ondblclick={(e) => toggleFullscreen(e.currentTarget)} title={(spotlightId === stream.id ? 'Click to shrink' : 'Click to enlarge') + ' · Double-click for fullscreen'}></video>
+              <figcaption><b>{name(userId)}</b> · {statLine(userId)}</figcaption>
+            </figure>
           {/if}
         {/each}
-      </div>
-      <div class="buttons">
-        <button onclick={() => store.toggleMic()} title="{call.micMuted ? 'Unmute' : 'Mute'} (Ctrl+Shift+M)">
-          {call.micMuted ? 'Unmute' : 'Mute'}
-        </button>
-        <button
-          class:active={call.deafened}
-          onclick={() => store.toggleDeafen()}
-          title="{call.deafened ? 'Undeafen' : 'Deafen'} (Ctrl+Shift+D)"
-        >
-          {call.deafened ? 'Undeafen' : 'Deafen'}
-        </button>
-        <button class={call.broadcasting ? 'danger' : 'primary'} onclick={() => store.toggleBroadcast()}>
-          {call.broadcasting ? 'Stop sharing' : 'Share screen'}
-        </button>
-        <button onclick={() => (showSettings = !showSettings)} title="Broadcast settings">⚙</button>
-        <button class="danger" onclick={() => store.leaveCall()}>Leave</button>
-      </div>
+      {/each}
+    </div>
+    {/if}
+
+    <div class="people">
+      {#each call.participants as p (p)}
+        {@const self = p === call.selfId}
+        <div class="person-wrap">
+          <button
+            class="person"
+            class:speaking={store.speaking[p]}
+            class:self
+            disabled={self}
+            title={self ? 'You' : `${name(p)} — click to adjust volume`}
+            onclick={() => (volumeFor = volumeFor === p ? null : p)}
+            oncontextmenu={(e) => {
+              if (self) return;
+              e.preventDefault();
+              volumeFor = p;
+            }}
+          >
+            <span class="avatar">{name(p).slice(0, 1).toUpperCase()}</span>
+            <span class="pname">{name(p)}{self ? ' (you)' : ''}</span>
+            {#if isMuted(p)}<span class="state" title="Muted"><Icon name="mic-off" size={14} /></span>{/if}
+            {#if isDeafened(p)}<span class="state" title="Deafened"><Icon name="headphones-off" size={14} /></span>{/if}
+            {#if !self && volumePct(p) !== 100}<span class="vol-badge">{volumePct(p)}%</span>{/if}
+          </button>
+          {#if volumeFor === p && !self}
+            <VolumePopover userId={p} name={name(p)} onclose={() => (volumeFor = null)} />
+          {/if}
+        </div>
+      {/each}
+    </div>
+
+    {#if loopbackRisk}
+      <p class="warn">
+        {canRestrictOwnAudio()
+          ? "Your share's system audio couldn't exclude this app's own sound,"
+          : "This app version can't keep call audio out of your shared system audio,"}
+        so others may hear themselves. Set a separate <b>Output device</b> in
+        <button class="inline-link" onclick={() => (store.settingsOpen = 'voice')}>Settings</button>
+        or turn off Game/system audio.
+      </p>
+    {/if}
+
+    <div class="controlbar">
+      <button
+        class="round"
+        class:off={store.micMuted}
+        aria-pressed={store.micMuted}
+        onclick={() => store.toggleMic()}
+        title="{store.micMuted ? 'Unmute' : 'Mute'} ({formatAccelerator(store.keybinds.toggleMute)})"
+      >
+        <Icon name={store.micMuted ? 'mic-off' : 'mic'} size={20} />
+      </button>
+      <button
+        class="round"
+        class:off={store.deafened}
+        aria-pressed={store.deafened}
+        onclick={() => store.toggleDeafen()}
+        title="{store.deafened ? 'Undeafen' : 'Deafen'} ({formatAccelerator(store.keybinds.toggleDeafen)})"
+      >
+        <Icon name={store.deafened ? 'headphones-off' : 'headphones'} size={20} />
+      </button>
+      <button
+        class="pill"
+        class:on={call.broadcasting}
+        disabled={call.broadcastStarting}
+        onclick={() => store.toggleBroadcast()}
+        title={call.broadcasting ? 'Stop sharing' : 'Share your screen'}
+      >
+        <Icon name={call.broadcasting ? 'screen-off' : 'screen'} size={20} />
+        {call.broadcastStarting ? 'Choosing…' : call.broadcasting ? 'Stop sharing' : 'Share screen'}
+      </button>
+      <button class="round" class:sel={showSettings} onclick={() => (showSettings = !showSettings)} title="Stream quality settings">
+        <Icon name="sliders" size={20} />
+      </button>
+      <button class="round hang" onclick={() => store.leaveCall()} title="Leave call">
+        <Icon name="hangup" size={20} />
+      </button>
     </div>
 
     {#if showSettings}
-      <div class="row settings">
+      <div class="settings">
         <label>
           Codec
           <select bind:value={s.codec} onchange={() => store.applyBroadcastSettings()}>
@@ -235,24 +297,14 @@
             <option value={100}>100 Mb/s</option>
           </select>
         </label>
-        {#if call.outputDevices.length > 1}
-          <label>
-            Call audio output
-            <select
-              value={call.outputDeviceId}
-              onchange={(e) => store.setOutputDevice(e.currentTarget.value)}
-            >
-              <option value="">Default</option>
-              {#each call.outputDevices as d (d.deviceId)}
-                {#if d.deviceId && d.deviceId !== 'default'}
-                  <option value={d.deviceId}>{d.label}</option>
-                {/if}
-              {/each}
-            </select>
-          </label>
-        {/if}
         {#if uploadEstimate > 0}
           <span class="estimate">≈{uploadEstimate.toFixed(0)} Mb/s upload ({call.relay?.outgoing ? 'relay tree' : `${call.participants.length - 1} viewer${call.participants.length === 2 ? '' : 's'}`})</span>
+        {/if}
+        {#if s.frameRate === 60}
+          <p class="hint">
+            60 fps needs bits: at 1080p use 8 Mb/s or more, or frames get dropped
+            (the preview caption shows what the capture and encoder actually deliver).
+          </p>
         {/if}
         {#if call.relay?.local.busy}
           <p class="hint">
@@ -260,94 +312,78 @@
             so your upload and CPU stay with the game.
           </p>
         {/if}
-        {#if s.systemAudio && Object.keys(call.remoteStreams).length > 0}
-          <p class="hint">
-            Sharing system audio while hearing others can echo their voices back.
-            Route “Call audio output” to a separate device to avoid the loop.
-          </p>
-        {/if}
       </div>
     {/if}
-
-    <div class="tiles" class:has-spotlight={spotlightId != null}>
-      {#if call.broadcasting && call.manager.localScreen}
-        {@const id = `local:${call.manager.localScreen.id}`}
-        <figure class="tile local" class:spotlight={spotlightId === id} class:dimmed={spotlightId != null && spotlightId !== id}>
-          <!-- svelte-ignore a11y_media_has_caption -->
-          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-          <video autoplay playsinline muted controls use:srcObject={call.manager.localScreen} onclick={() => toggleSpotlight(id)} ondblclick={(e) => toggleFullscreen(e.currentTarget)} title={(spotlightId === id ? 'Click to shrink' : 'Click to enlarge') + ' · Double-click for fullscreen'}></video>
-          <figcaption>You (preview) · {relayOutLine() || statLine(call.participants.find((p) => p !== call.selfId) ?? '')}</figcaption>
-        </figure>
-      {/if}
-      {#each Object.entries(call.remoteStreams) as [userId, streams] (userId)}
-        {#each streams as stream (stream.id)}
-          {#if hasVideo(stream)}
-            <figure class="tile" class:spotlight={spotlightId === stream.id} class:dimmed={spotlightId != null && spotlightId !== stream.id}>
-              <!-- svelte-ignore a11y_media_has_caption -->
-              <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-              <!-- Muted: this peer's audio is played (and volume-controlled) by the mixer. -->
-              <video autoplay playsinline use:srcObject={stream} onclick={() => toggleSpotlight(stream.id)} ondblclick={(e) => toggleFullscreen(e.currentTarget)} title={(spotlightId === stream.id ? 'Click to shrink' : 'Click to enlarge') + ' · Double-click for fullscreen'}></video>
-              <figcaption>{name(userId)} · {statLine(userId)}</figcaption>
-            </figure>
-          {/if}
-        {/each}
-      {/each}
-    </div>
   </section>
 {/if}
 
 <style>
   .panel {
+    flex: none;
     border-bottom: 1px solid var(--bg-3);
     background: var(--bg-1);
-    padding: 10px 16px;
+    padding: 12px 16px 10px;
     display: flex;
     flex-direction: column;
     gap: 10px;
   }
-  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .controls { justify-content: space-between; }
-  .participants { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-  .chip {
-    background: var(--bg-3);
-    color: var(--fg-0);
-    border-radius: 999px;
-    padding: 3px 10px;
-    font-size: 12.5px;
-    line-height: 1.5;
-  }
-  .chip.me { outline: 1px solid var(--accent); }
-  button.chip { display: inline-flex; align-items: center; gap: 5px; }
-  button.chip.adjusted { outline: 1px solid var(--fg-1); }
-  .vol-badge { color: var(--fg-1); font-size: 11px; }
 
-  .chip-wrap { position: relative; }
-  .vol-pop {
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 0;
-    z-index: 30;
+  .people { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  .person-wrap { position: relative; }
+  .person {
     display: flex;
     align-items: center;
     gap: 8px;
-    background: var(--bg-1);
-    border: 1px solid var(--bg-3);
+    background: var(--bg-2);
+    border-radius: 999px;
+    padding: 4px 12px 4px 4px;
+    font-size: 13px;
+    box-shadow: 0 0 0 2px transparent;
+    transition: box-shadow 80ms;
+  }
+  .person:disabled { opacity: 1; cursor: default; }
+  .person.speaking { box-shadow: 0 0 0 2px var(--ok); }
+  .avatar {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    background: var(--bg-3);
+    display: grid;
+    place-items: center;
+    font-weight: 700;
+    font-size: 12px;
+  }
+  .person.self .avatar { background: var(--accent); color: #0d1117; }
+  .pname { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .state { color: var(--danger); display: inline-flex; }
+  .vol-badge { color: var(--fg-1); font-size: 11px; }
+
+  .controlbar { display: flex; justify-content: center; align-items: center; gap: 10px; }
+  .controlbar button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    height: 44px;
+    background: var(--bg-3);
+    color: var(--fg-0);
+  }
+  .round { width: 44px; padding: 0; border-radius: 50%; }
+  .pill { border-radius: 22px; padding: 0 18px; font-weight: 600; }
+  .controlbar .off { background: var(--danger); color: #0d1117; }
+  .controlbar .on { background: var(--ok); color: #0d1117; }
+  .controlbar .sel { outline: 2px solid var(--accent); }
+  .controlbar .hang { background: var(--danger); color: #0d1117; }
+
+  .settings {
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    flex-wrap: wrap;
+    background: var(--bg-2);
     border-radius: var(--radius);
-    padding: 8px 10px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    padding: 10px 12px;
   }
-  .vol-pop input[type='range'] {
-    width: 130px;
-    padding: 0;
-    border: none;
-    background: transparent;
-    accent-color: var(--accent);
-  }
-  .vol-num { font-size: 12px; color: var(--fg-1); min-width: 34px; text-align: right; }
-
-  .buttons { display: flex; gap: 6px; }
-  .buttons button.active { background: var(--accent); color: #0d1117; font-weight: 600; }
-
   .settings label {
     display: flex;
     flex-direction: column;
@@ -355,18 +391,36 @@
     font-size: 11.5px;
     color: var(--fg-1);
   }
-  .settings label.check { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; }
-  .estimate { color: var(--fg-1); font-size: 12px; margin-left: auto; }
-  .settings .hint {
+  .settings label.check { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; align-self: center; }
+  .estimate { color: var(--fg-1); font-size: 12px; margin-left: auto; align-self: center; }
+  .hint, .warn {
     flex-basis: 100%;
     margin: 0;
     color: var(--fg-1);
     font-size: 11.5px;
     line-height: 1.4;
   }
+  .warn {
+    color: var(--fg-0);
+    background: color-mix(in srgb, var(--danger) 18%, transparent);
+    border-radius: var(--radius);
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+  .inline-link { background: none; padding: 0; color: var(--accent); text-decoration: underline; font-size: inherit; }
 
-  .tiles { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-start; }
-  .tile { margin: 0; max-width: 480px; flex: 1 1 320px; }
+  /* Videos get a bounded, scrollable area so the chat below always keeps room
+     (and popovers in the rows below aren't clipped by a scroll container). */
+  .tiles {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: center;
+    max-height: 48vh;
+    overflow-y: auto;
+  }
+  .tile { margin: 0; max-width: 560px; flex: 1 1 320px; }
   .tile video {
     width: 100%;
     border-radius: var(--radius);
@@ -386,9 +440,10 @@
   }
   .tile.spotlight video {
     cursor: zoom-out;
-    max-height: 70vh;
+    max-height: 46vh;
     object-fit: contain;
   }
   .tile.dimmed { flex: 0 0 200px; max-width: 200px; }
   figcaption { font-size: 11.5px; color: var(--fg-1); margin-top: 2px; }
+  figcaption b { color: var(--fg-0); }
 </style>

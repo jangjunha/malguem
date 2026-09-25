@@ -2,6 +2,9 @@
   import ChannelView from './ChannelView.svelte';
   import Modal from './Modal.svelte';
   import ServerForm from './ServerForm.svelte';
+  import UserPanel from './UserPanel.svelte';
+  import VolumePopover from './VolumePopover.svelte';
+  import Icon from './Icon.svelte';
   import { copyText } from '../lib/clipboard';
   import { store } from '../lib/store.svelte';
 
@@ -22,6 +25,9 @@
   let textInput = $state('');
   let copied = $state(false);
   let busy = $state(false);
+
+  /** Call participant whose volume popover is open in the sidebar. */
+  let sideVolumeFor = $state<string | null>(null);
 
   let newChannelName = $state('');
   let addingChannel = $state(false);
@@ -171,13 +177,49 @@
             {#if active}
               <div class="channels">
                 {#each sp.channels as c (c.id)}
+                  {@const inCall = store.call?.serverId === srv.id && store.call.channelId === c.id}
                   <button
                     class="channel"
                     class:active={c.id === store.activeChannelId}
                     onclick={() => store.selectChannel(srv.id, sp.id, c.id)}
                   >
                     # {c.name}
+                    {#if inCall}<span class="live" title="You're in this channel's call">●</span>{/if}
                   </button>
+                  {#if inCall && store.call}
+                    {@const call = store.call}
+                    <!-- Who's in the call, Discord-style under the channel. -->
+                    <ul class="voice-users">
+                      {#each call.participants as p (p)}
+                        {@const self = p === call.selfId}
+                        {@const muted = self ? store.micMuted : call.peerStates[p]?.muted}
+                        {@const deaf = self ? store.deafened : call.peerStates[p]?.deafened}
+                        <li class="voice-user-wrap">
+                          <button
+                            class="voice-user"
+                            disabled={self}
+                            title={self ? 'You' : 'Click to adjust volume'}
+                            onclick={() => (sideVolumeFor = sideVolumeFor === p ? null : p)}
+                          >
+                            <span class="mini-avatar" class:speaking={store.speaking[p]}>
+                              {store.memberName(srv.id, sp.id, p).slice(0, 1).toUpperCase()}
+                            </span>
+                            <span class="vu-name">{store.memberName(srv.id, sp.id, p)}</span>
+                            {#if call.broadcasting && self}<span class="tag">LIVE</span>{/if}
+                            {#if muted}<span class="vu-state"><Icon name="mic-off" size={13} /></span>{/if}
+                            {#if deaf}<span class="vu-state"><Icon name="headphones-off" size={13} /></span>{/if}
+                          </button>
+                          {#if sideVolumeFor === p && !self}
+                            <VolumePopover
+                              userId={p}
+                              name={store.memberName(srv.id, sp.id, p)}
+                              onclose={() => (sideVolumeFor = null)}
+                            />
+                          {/if}
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
                 {/each}
                 {#if isOwner}
                   {#if addingChannel}
@@ -223,6 +265,7 @@
         {/if}
       </div>
     {/if}
+    <UserPanel />
   </aside>
 
   <main>
@@ -337,6 +380,7 @@
   .layout {
     display: grid;
     grid-template-columns: 240px 1fr;
+    grid-template-rows: minmax(0, 1fr);
     height: 100%;
   }
 
@@ -344,9 +388,18 @@
     background: var(--bg-1);
     display: flex;
     flex-direction: column;
+    min-height: 0;
+  }
+  /* Servers and members scroll; the user panel stays pinned at the bottom. */
+  .servers {
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
   }
-  .servers { padding: 8px; display: flex; flex-direction: column; gap: 4px; }
 
   .server { display: flex; flex-direction: column; gap: 2px; padding-bottom: 6px; }
   .server-head {
@@ -394,6 +447,40 @@
     border-radius: var(--radius);
   }
   .channel.active { background: var(--bg-3); color: var(--fg-0); }
+  .channel .live { color: var(--ok); font-size: 9px; margin-left: 4px; vertical-align: middle; }
+
+  .voice-users { list-style: none; margin: 0 0 4px; padding: 0 0 0 14px; display: flex; flex-direction: column; gap: 1px; }
+  .voice-user-wrap { position: relative; }
+  .voice-user {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    color: var(--fg-1);
+    padding: 3px 6px;
+    font-size: 12.5px;
+    text-align: left;
+  }
+  .voice-user:disabled { opacity: 1; cursor: default; }
+  .voice-user:not(:disabled):hover { background: var(--bg-2); color: var(--fg-0); }
+  .mini-avatar {
+    flex: none;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--bg-3);
+    display: grid;
+    place-items: center;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--fg-0);
+    box-shadow: 0 0 0 2px transparent;
+  }
+  .mini-avatar.speaking { box-shadow: 0 0 0 2px var(--ok); }
+  .vu-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .vu-state { color: var(--danger); display: inline-flex; }
+  .tag { background: var(--danger); color: #0d1117; font-size: 9px; font-weight: 700; border-radius: 3px; padding: 0 4px; }
   .channel.dim { font-size: 12.5px; }
   .channels input { width: 100%; }
 
@@ -409,7 +496,13 @@
     padding: 6px;
   }
 
-  .members { padding: 8px 12px; margin-top: auto; border-top: 1px solid var(--bg-3); }
+  .members {
+    padding: 8px 12px;
+    border-top: 1px solid var(--bg-3);
+    flex: 0 1 auto;
+    max-height: 35%;
+    overflow-y: auto;
+  }
   .members h3 {
     font-size: 11px;
     text-transform: uppercase;
@@ -431,7 +524,7 @@
   .kick { margin-left: auto; background: transparent; color: var(--fg-1); padding: 0 4px; }
   .invite { margin-top: 8px; width: 100%; font-size: 12.5px; }
 
-  main { background: var(--bg-2); min-width: 0; }
+  main { background: var(--bg-2); min-width: 0; min-height: 0; overflow: hidden; }
   .empty { color: var(--fg-1); display: grid; place-items: center; height: 100%; }
 
   /* modal contents */

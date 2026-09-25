@@ -57,10 +57,17 @@ export interface PeerStats {
   transport: 'direct' | 'relay' | null;
 }
 
+/** Mic/deafen state a participant shows the others (Discord's crossed-out icons). */
+export interface PeerState {
+  muted: boolean;
+  deafened: boolean;
+}
+
 interface SignalPayload {
-  kind: 'sdp' | 'ice';
+  kind: 'sdp' | 'ice' | 'state';
   description?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit | null;
+  state?: PeerState;
 }
 
 interface Peer {
@@ -112,6 +119,16 @@ export interface CallCallbacks {
   onEnded: () => void;
   /** Relay engine snapshot, once per second (relay tree, per-link state). */
   onRelayStats?: (stats: HubStats) => void;
+  /** A participant's mute/deafen state changed. */
+  onPeerState?: (userId: string, state: PeerState) => void;
+}
+
+/** Whether this webview can keep its own playback out of a system-audio capture. */
+export function canRestrictOwnAudio(): boolean {
+  const supported = navigator.mediaDevices?.getSupportedConstraints?.() as
+    | (MediaTrackSupportedConstraints & { restrictOwnAudio?: boolean })
+    | undefined;
+  return supported?.restrictOwnAudio === true;
 }
 
 export class CallManager {
@@ -135,7 +152,20 @@ export class CallManager {
   private meshBroadcast: MediaStream | null = null;
   /** Watches for a game / CPU pressure so a busy PC stops relaying. */
   private loadMonitor: LoadMonitor | null = null;
+  /** Chain that serializes applySenderSettings runs. */
+  private senderQueue: Promise<void> = Promise.resolve();
+  /** In-flight startBroadcast (the share picker can stay open for a while). */
+  private starting: Promise<void> | null = null;
+  /** Set by stopBroadcast/leave while a start is in flight: discard its capture. */
+  private startCancelled = false;
+  /** What we tell peers about our mic/deafen state. */
+  private selfState: PeerState = { muted: false, deafened: false };
   settings: BroadcastSettings = { ...DEFAULT_BROADCAST };
+  /**
+   * Whether our system-audio capture leaves out what this app plays (peers'
+   * voices, their shared audio). Null until a share with system audio starts.
+   */
+  ownAudioExcluded: boolean | null = null;
 
   constructor(
     private socket: EventSocket,
@@ -148,10 +178,13 @@ export class CallManager {
     private cb: CallCallbacks,
   ) {}
 
-  async join(): Promise<void> {
-    this.micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
+  /**
+   * Join with an already-captured mic stream. The caller owns it (volume,
+   * sensitivity, device switching — see lib/mic) and stops it after leave().
+   */
+  async join(mic: MediaStream, state: PeerState): Promise<void> {
+    this.micStream = mic;
+    this.selfState = { ...state };
     this.relay = new RelayHub(
       {
         myId: this.myId,
@@ -204,41 +237,88 @@ export class CallManager {
       this.cb.onRemoteStreams(id, []);
     }
     this.peers.clear();
-    this.stopTracks(this.micStream);
+    this.startCancelled = this.starting !== null;
     this.stopTracks(this.screenStream);
     this.micStream = null;
     this.screenStream = null;
     this.cb.onEnded();
   }
 
-  setMicMuted(muted: boolean): void {
-    for (const t of this.micStream?.getAudioTracks() ?? []) t.enabled = !muted;
+  /** Tell everyone in the call our mic/deafen state. */
+  setSelfState(state: PeerState): void {
+    this.selfState = { ...state };
+    for (const id of this.peers.keys()) this.sendSignal(id, { kind: 'state', state: this.selfState });
   }
 
   get isBroadcasting(): boolean {
     return this.screenStream !== null;
   }
 
+  /** The share picker is open / the broadcast is being set up. */
+  get isStartingBroadcast(): boolean {
+    return this.starting !== null;
+  }
+
   get localScreen(): MediaStream | null {
     return this.screenStream;
   }
 
-  /** Start the screen broadcast with the current sender-side settings. */
-  async startBroadcast(): Promise<void> {
-    if (this.screenStream) return;
+  /** What the capture actually delivers (the OS may give less than asked). */
+  captureSettings(): { width: number; height: number; frameRate: number } | null {
+    const st = this.screenStream?.getVideoTracks()[0]?.getSettings();
+    if (!st?.width || !st.height) return null;
+    return { width: st.width, height: st.height, frameRate: Math.round(st.frameRate ?? 0) };
+  }
+
+  /**
+   * Start the screen broadcast with the current sender-side settings.
+   *
+   * Idempotent while in flight: a second click while the share picker is open
+   * joins the same start instead of capturing a second screen. (Two captures
+   * used to race here: the first one's tracks stayed attached to every peer
+   * with nothing referencing them, so "Stop sharing" could never end it.)
+   */
+  startBroadcast(): Promise<void> {
+    if (this.screenStream) return Promise.resolve();
+    if (!this.starting) {
+      this.startCancelled = false;
+      this.starting = this.doStartBroadcast().finally(() => {
+        this.starting = null;
+      });
+    }
+    return this.starting;
+  }
+
+  private async doStartBroadcast(): Promise<void> {
     const s = this.settings;
     const video: MediaTrackConstraints = { frameRate: { ideal: s.frameRate, max: s.frameRate } };
     if (s.height > 0) video.height = { ideal: s.height, max: s.height };
+    const audioConstraints: MediaTrackConstraints & { restrictOwnAudio?: boolean } = {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+      // Leave out what this app itself plays — peers' voices and the
+      // broadcast we're watching — or they loop back to everyone
+      // (Chromium 141+, Windows/macOS).
+      restrictOwnAudio: true,
+    };
     const options: DisplayMediaStreamOptions & Record<string, unknown> = {
       video,
-      audio: s.systemAudio
-        ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-        : false,
+      audio: s.systemAudio ? audioConstraints : false,
       // Chromium extensions: prefer full monitors and include system audio.
       systemAudio: s.systemAudio ? 'include' : 'exclude',
       monitorTypeSurfaces: 'include',
     };
     const stream = await navigator.mediaDevices.getDisplayMedia(options);
+    if (this.startCancelled || !this.joined) {
+      // Stopped / left while the picker was open.
+      this.stopTracks(stream);
+      return;
+    }
+    const audio = stream.getAudioTracks()[0];
+    this.ownAudioExcluded = audio
+      ? (audio.getSettings() as MediaTrackSettings & { restrictOwnAudio?: boolean }).restrictOwnAudio === true
+      : null;
     for (const track of stream.getVideoTracks()) {
       // Bias the encoder toward keeping frame rate up under load — games are motion.
       track.contentHint = 'motion';
@@ -286,6 +366,7 @@ export class CallManager {
   }
 
   stopBroadcast(): void {
+    if (this.starting) this.startCancelled = true;
     const stream = this.screenStream;
     if (!stream) return;
     this.screenStream = null;
@@ -306,8 +387,22 @@ export class CallManager {
     this.cb.onBroadcastChanged(false);
   }
 
-  /** Re-apply codec/bitrate/fps caps to all live senders. */
-  async applySenderSettings(): Promise<void> {
+  /**
+   * Re-apply codec/bitrate/fps caps to all live senders.
+   *
+   * Serialized: it's triggered per peer as tracks are added and again on every
+   * settings change, and overlapping getParameters()/setParameters() pairs on
+   * the same sender make Chromium reject the later set (stale transaction) —
+   * which used to be swallowed, silently leaving the low default screen-share
+   * bitrate in place (and with it, dropped frames instead of 60 fps).
+   */
+  applySenderSettings(): Promise<void> {
+    const run = this.senderQueue.then(() => this.doApplySenderSettings());
+    this.senderQueue = run.catch(() => {});
+    return run;
+  }
+
+  private async doApplySenderSettings(): Promise<void> {
     const s = this.settings;
     this.relay?.setUploadCapacity(s.relayUploadMbps * 1000);
     const screenVideo = this.screenStream?.getVideoTracks()[0];
@@ -340,13 +435,26 @@ export class CallManager {
           const rest = codecs.filter((c) => !want.includes(c));
           if (want.length > 0) tr.setCodecPreferences([...want, ...rest]);
         }
-        const params = sender.getParameters();
-        params.encodings = params.encodings?.length ? params.encodings : [{}];
-        for (const enc of params.encodings) {
-          enc.maxBitrate = s.maxBitrateKbps * 1000;
+        // get → set with nothing in between (each get allows one set).
+        const caps = (withPreference: boolean) => {
+          const params = sender.getParameters() as RTCRtpSendParameters & { degradationPreference?: string };
+          params.encodings = params.encodings?.length ? params.encodings : [{}];
+          for (const enc of params.encodings) {
+            enc.maxBitrate = s.maxBitrateKbps * 1000;
+            enc.maxFramerate = s.frameRate;
+            enc.priority = 'high';
+            enc.networkPriority = 'high';
+          }
+          // Games are motion: under pressure drop resolution, not frame rate.
+          if (withPreference) params.degradationPreference = 'maintain-framerate';
+          return sender.setParameters(params);
+        };
+        try {
+          await caps(true);
+        } catch {
+          // A webview that rejects the optional preference must still get the caps.
+          await caps(false).catch((e) => console.warn('sender caps rejected', e));
         }
-        (params as { degradationPreference?: string }).degradationPreference = 'maintain-framerate';
-        await sender.setParameters(params).catch(() => {});
       }
     }
   }
@@ -468,6 +576,10 @@ export class CallManager {
 
     if (this.micStream) this.addStreamTracks(peer, this.micStream);
     if (this.meshBroadcast) this.addStreamTracks(peer, this.meshBroadcast);
+    // Let them know whether we're muted (they may have joined after we muted).
+    queueMicrotask(() => {
+      if (this.peers.get(userId) === peer) this.sendSignal(userId, { kind: 'state', state: this.selfState });
+    });
     // Pre-negotiated relay data channels ride this same connection.
     this.relay?.attachPeer(userId, pc);
 
@@ -557,6 +669,11 @@ export class CallManager {
           await pc.setLocalDescription();
           this.sendSignal(from, { kind: 'sdp', description: pc.localDescription!.toJSON() });
         }
+      } else if (payload.kind === 'state' && payload.state) {
+        this.cb.onPeerState?.(from, {
+          muted: payload.state.muted === true,
+          deafened: payload.state.deafened === true,
+        });
       } else if (payload.kind === 'ice') {
         try {
           await pc.addIceCandidate(payload.candidate ?? undefined);
