@@ -170,6 +170,38 @@ errors** at every viewer. `sim/smoke/` runs the actual app `CallManager`
 (relay transport) three times against a fake server: both viewers render
 ~30 fps, one of them through the other.
 
+### 5. Gaming PCs stay light
+
+A relay asks a viewer's machine for CPU and, above all, upload. On a gaming
+PC that upload fills the home router's buffer and raises the game's ping. So
+each participant watches its own load (`load.ts`):
+
+- **Signals:** a fullscreen app in front, from the Windows shell's
+  notification state (`SHQueryUserNotificationState`, which Windows itself
+  uses to hold back toasts during games; our own fullscreen stream tile
+  doesn't count); Compute Pressure `serious`/`critical`; or the page's
+  timers running late. Busy starts at once and ends 15 s after the last
+  signal, so a game menu or alt-tab doesn't reshuffle the tree.
+- **A busy viewer relays nothing.** It offers 0 relay capacity, and the
+  broadcaster moves its children right away (make-before-break).
+- **A busy broadcaster** (usually the one sharing the game) feeds a single
+  viewer directly, lets the tree do the rest, and holds its uplink queue to
+  15 ms instead of 40 ms.
+- **Decoding less:** a viewer whose window is hidden asks its parent for
+  the base layer only (¼ of the frames), and a CPU-starved one for half.
+  Relays always take everything, since their children need it.
+
+Measured (2 runs each; uplink queue = extra delay a game's packets would
+see on that uplink):
+
+| | Before | While gaming |
+|---|---|---|
+| Relay minji starts a game (`tree-relay-games`): minji's upload | 34–47 Mb/s | **0.5–0.8 Mb/s** |
+| Viewers under minji at that moment | | 0.3–1.7 s freeze, then fed by others (≤ 0.6 s when she quits) |
+| Streamer sharing its game (`tree-streamer-games` vs `tree-busy`): uplink queue p95 | 26–156 ms | **11–41 ms** |
+| … streamer upload / browser CPU | 16 Mb/s / 22 % | **9 Mb/s / 15 %** |
+| … viewers | 49.6 fps, 78 % full quality | 50.0 fps, 80 % full quality |
+
 ## Conclusions
 
 - The idea holds up. Encoding once and forwarding bytes removes the
@@ -190,10 +222,13 @@ errors** at every viewer. `sim/smoke/` runs the actual app `CallManager`
    codecs. On Windows, check which encoder `chooseEncoder` picks (the log
    shows `hardware: true/false` and the codec) and whether H.264 hardware
    offers L1T3. Without temporal layers, relays can't shed load gracefully.
-2. **Relays on busy PCs.** A relay that is also running a game adds main-thread
-   latency. In the simulator a saturated host CPU stalled whole SCTP
-   associations. Watch the "relay via X" caption for viewers whose parent is
-   gaming.
+2. **Busy-PC detection in the real world.** Fullscreen detection is
+   Windows-only and hasn't been tried with real games (borderless windowed
+   games should report as fullscreen, but check). On macOS only the CPU and
+   timer signals apply. When it works, the sharer's settings show "Game
+   detected" and the preview caption says "light mode". In the simulator a
+   saturated host CPU stalled whole SCTP associations, which is why busy
+   machines stop relaying.
 3. **Static screens:** Chromium delivers capture frames only on change. The
    encoder re-encodes the last frame at ≥ 4 fps so viewers aren't marked
    orphaned, which hasn't been tested with real capture.

@@ -90,7 +90,8 @@
     const o = call?.relay?.outgoing;
     if (!o) return '';
     const direct = Object.values(o.tree).filter((p) => p === call?.selfId).length;
-    return `relay · ${o.viewers.length} watching · ${direct} fed directly`;
+    const light = call?.relay?.local.busy ? ' · light mode (game detected)' : '';
+    return `relay · ${o.viewers.length} watching · ${direct} fed directly${light}`;
   }
 
   function statLine(userId: string): string {
@@ -252,6 +253,12 @@
         {/if}
         {#if uploadEstimate > 0}
           <span class="estimate">≈{uploadEstimate.toFixed(0)} Mb/s upload ({call.relay?.outgoing ? 'relay tree' : `${call.participants.length - 1} viewer${call.participants.length === 2 ? '' : 's'}`})</span>
+        {/if}
+        {#if call.relay?.local.busy}
+          <p class="hint">
+            Game detected ({call.relay.local.reasons.join(', ')}): not passing others' relayed streams on,
+            so your upload and CPU stay with the game.
+          </p>
         {/if}
         {#if s.systemAudio && Object.keys(call.remoteStreams).length > 0}
           <p class="hint">

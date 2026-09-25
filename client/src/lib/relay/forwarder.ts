@@ -43,8 +43,10 @@ export interface LinkTuning {
 export const MAX_LAYER = 2;
 
 export class ChildLink {
-  /** Highest temporal layer currently forwarded. */
+  /** Highest temporal layer currently forwarded (congestion control). */
   maxLayer = MAX_LAYER;
+  /** Highest layer the child asked for (busy or hidden child); not congestion. */
+  ceiling = MAX_LAYER;
   bytesSent = 0;
   framesSent = 0;
   framesDropped = 0;
@@ -125,7 +127,7 @@ export class ChildLink {
       this.chainBroken = false;
       return true;
     }
-    if (h.tl > this.maxLayer || this.skipped.has(h.depSeq) || q > hard) {
+    if (h.tl > Math.min(this.maxLayer, this.ceiling) || this.skipped.has(h.depSeq) || q > hard) {
       if (h.tl === 0 && !this.skipped.has(h.depSeq)) this.chainBroken = true;
       this.skipped.add(h.seq);
       if (this.skipped.size > 256) {

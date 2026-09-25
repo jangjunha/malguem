@@ -261,3 +261,64 @@ describe('ChildLink', () => {
     expect(link.chainBroken).toBe(false);
   });
 });
+
+describe('local load', () => {
+  it('turns busy at once and calm only after a quiet period', async () => {
+    const { LoadMonitor } = await import('./load');
+    let t = 0;
+    const seen: boolean[] = [];
+    const m = new LoadMonitor((l) => seen.push(l.busy), { now: () => t });
+    m.signal('fullscreen-app', true);
+    expect(m.current.busy).toBe(true);
+    expect(m.current.reasons).toEqual(['fullscreen-app']);
+    t = 5_000;
+    m.signal('fullscreen-app', false);
+    expect(m.current.busy).toBe(true); // a game menu or alt-tab doesn't reshuffle the tree
+    t = 21_000;
+    m.signal('fullscreen-app', false);
+    expect(m.current.busy).toBe(false);
+    expect(seen).toEqual([true, false]);
+  });
+
+  it('counts the calm period from when an edge-triggered signal ends', async () => {
+    const { LoadMonitor } = await import('./load');
+    let t = 0;
+    const m = new LoadMonitor(() => {}, { now: () => t });
+    m.signal('cpu-pressure', true); // PressureObserver only reports changes
+    t = 600_000;
+    m.signal('cpu-pressure', false);
+    expect(m.current.busy).toBe(true);
+    t = 616_000;
+    m.signal('cpu-pressure', false);
+    expect(m.current.busy).toBe(false);
+  });
+
+  it('lets a busy broadcaster feed only one viewer when relays exist', () => {
+    const viewers = [
+      { id: 'a', capacityKbps: 50_000, rttMs: {} },
+      { id: 'c', capacityKbps: 50_000, rttMs: {} },
+      { id: 'l', capacityKbps: 0, rttMs: {} },
+    ];
+    const p = planTree({ root: 'b', rootCapacityKbps: 100_000, bitrateKbps: 8000, viewers, rootMaxSlots: 1 });
+    expect(p.children.get('b')).toHaveLength(1);
+    expect(p.degraded.size).toBe(0);
+  });
+
+  it('respects a child-requested layer ceiling without calling it congestion', () => {
+    const ch = { bufferedAmount: 0, readyState: 'open' as RTCDataChannelState, send: () => {} };
+    const link = new ChildLink('c', ch, null, { bitrateKbps: 8000 });
+    link.ceiling = 0;
+    const d = new LayerDeps();
+    const pat = [0, 2, 1, 2];
+    const sent = Array.from({ length: 8 }, (_, seq) => {
+      const tl = pat[seq % 4]!;
+      const f = frame(seq, { key: seq === 0, tl, depSeq: d.next(seq, tl, seq === 0) });
+      const c = chunkFrame(1, f)[0]!;
+      return link.offer(c, readHeader(c)!);
+    });
+    expect(sent).toEqual([true, false, false, false, true, false, false, false]);
+    for (let t = 0; t <= 1000; t += 100) link.adapt(t);
+    expect(link.degradedSince).toBeNull();
+    expect(link.chainBroken).toBe(false);
+  });
+});

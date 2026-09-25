@@ -48,6 +48,7 @@ declare global {
     __simPeerLeft: (id: string) => void;
     __simLeave: () => void;
     __simSetCap: (kbps: number) => void;
+    __simSetBusy: (busy: boolean) => void;
   }
 }
 
@@ -425,6 +426,10 @@ window.__simLeave = () => {
 };
 
 window.__simSetCap = (kbps) => hub.setUploadCapacity(kbps);
+
+/** Stand-in for the LoadMonitor: the harness says when this player is in a game. */
+window.__simSetBusy = (busy) =>
+  hub.setLocalLoad({ busy, reasons: busy ? ['fullscreen-app'] : [], critical: false, hidden: false });
 
 function pct(xs: number[], p: number): number | null {
   if (xs.length === 0) return null;

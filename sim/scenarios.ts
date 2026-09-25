@@ -63,7 +63,8 @@ export type TimelineEvent =
   | { at: number; type: 'link'; node: string; set: Partial<LinkProfile> }
   | { at: number; type: 'leave'; node: string } // graceful: closes connections
   | { at: number; type: 'crash'; node: string } // blackhole, roster notices later
-  | { at: number; type: 'unwatch'; node: string };
+  | { at: number; type: 'unwatch'; node: string }
+  | { at: number; type: 'busy'; node: string; on: boolean }; // starts / stops a game
 
 export interface Scenario {
   name: string;
@@ -207,6 +208,24 @@ export const SCENARIOS: Scenario[] = [
         k === 'streamer' ? [k, v] : [k, { ...v, link: { ...(v.link ?? {}), jitter_ms: 3, loss: 0.008, loss_burst: 3 } }],
       ),
     ),
+  },
+  {
+    ...base,
+    name: 'tree-relay-games',
+    description: 'tree-busy; the busiest relay (minji) starts a game at 15 s and quits at 30 s.',
+    durationS: 45,
+    nodes: group('busyUplink', 20_000),
+    events: [
+      { at: 15, type: 'busy', node: 'minji', on: true },
+      { at: 30, type: 'busy', node: 'minji', on: false },
+    ],
+  },
+  {
+    ...base,
+    name: 'tree-streamer-games',
+    description: 'tree-busy with the streamer in a game the whole time (sharing it): feeds one viewer, gaming-grade uplink queue target.',
+    nodes: group('busyUplink', 20_000),
+    events: [{ at: 0, type: 'busy', node: 'streamer', on: true }],
   },
   {
     ...base,

@@ -50,6 +50,8 @@ export interface PlanInput {
   defaultRttMs?: number;
   /** Cap on tree depth (root = 0). */
   maxDepth?: number;
+  /** Most viewers the root feeds itself when others can (busy broadcaster). */
+  rootMaxSlots?: number;
 }
 
 export interface Plan {
@@ -93,7 +95,10 @@ export function planTree(input: PlanInput): Plan {
   };
   // The broadcaster always feeds at least one viewer, whatever its estimate.
   const slots = new Map<string, number>([
-    [input.root, Math.max(1, slotsFor(input.rootCapacityKbps, input.bitrateKbps, headroom))],
+    [
+      input.root,
+      Math.max(1, Math.min(input.rootMaxSlots ?? Infinity, slotsFor(input.rootCapacityKbps, input.bitrateKbps, headroom))),
+    ],
   ]);
   const used = new Map<string, number>([[input.root, 0]]);
 

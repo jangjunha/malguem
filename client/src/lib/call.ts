@@ -12,6 +12,8 @@ import type { Identity } from './crypto';
 import { canonicalJson, signSignal, verifySignal } from './crypto';
 import { TrackDecoder, TrackEncoder, type RelayCodecConfig } from './relay/codec';
 import { RelayHub, type HubStats, type StreamInfo } from './relay/hub';
+import { LoadMonitor } from './relay/load';
+import { isTauri } from './platform';
 import type { EventSocket, ServerEvent } from './ws';
 
 export interface BroadcastSettings {
@@ -131,6 +133,8 @@ export class CallManager {
   private relayDecoders = new Map<string, { streamId: number; dec: TrackDecoder }>();
   /** What the mesh carries for our broadcast: the whole screen stream, or only its audio in relay mode. */
   private meshBroadcast: MediaStream | null = null;
+  /** Watches for a game / CPU pressure so a busy PC stops relaying. */
+  private loadMonitor: LoadMonitor | null = null;
   settings: BroadcastSettings = { ...DEFAULT_BROADCAST };
 
   constructor(
@@ -162,6 +166,15 @@ export class CallManager {
         onKeyframeRequest: () => this.relayEncoder?.requestKeyframe(),
       },
     );
+    this.loadMonitor = new LoadMonitor((load) => this.relay?.setLocalLoad(load), {
+      fullscreenApp: isTauri()
+        ? async () => {
+            const { invoke } = await import('@tauri-apps/api/core');
+            return invoke<boolean>('fullscreen_app_active');
+          }
+        : undefined,
+    });
+    this.loadMonitor.start();
     this.unsubscribe = this.socket.onEvent((ev) => this.handleEvent(ev));
     // A reconnect drops us from the server-side roster; re-join on reopen.
     this.reopenUnsub = this.socket.onOpen(() =>
@@ -182,6 +195,8 @@ export class CallManager {
     this.relayEncoder = null;
     for (const { dec } of this.relayDecoders.values()) dec.close();
     this.relayDecoders.clear();
+    this.loadMonitor?.stop();
+    this.loadMonitor = null;
     this.relay?.dispose();
     this.relay = null;
     for (const [id, peer] of this.peers) {

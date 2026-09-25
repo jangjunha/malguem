@@ -55,7 +55,8 @@ def main():
     out.write("|---|---|---|---|---|---|---|---|---|---|\n")
     for name in [
         "star-busy", "tree-busy", "tree-busy-partial", "tree-busy-reliable", "tree-relay-crash", "tree-relay-leave",
-        "tree-overclaim", "tree-uplink-drop", "tree-churn", "star-lossy-all", "tree-lossy-all",
+        "tree-overclaim", "tree-uplink-drop", "tree-churn", "tree-relay-games", "tree-streamer-games",
+        "star-lossy-all", "tree-lossy-all",
     ]:
         r = runs.get(name)
         if not r:

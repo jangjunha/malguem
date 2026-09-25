@@ -251,6 +251,9 @@ async function runScenarioInner(sc: Run, cleanup: (() => Promise<unknown> | void
         case 'unwatch':
           void call(ev.node, '__simUnwatch');
           break;
+        case 'busy':
+          void call(ev.node, '__simSetBusy', ev.on);
+          break;
         case 'leave':
           void call(ev.node, '__simLeave').then(() => browsers.get(ev.node)?.close());
           departed(ev.node, 0.3); // server sees the WebSocket close right away

@@ -29,6 +29,7 @@
  * child for DRAIN_MS, so the child's reference chain survives the switch.
  */
 import { ChildLink, MAX_LAYER, type LinkTuning, type SendChannel } from './forwarder';
+import type { LocalLoad } from './load';
 import { median, OwdTracker } from './owd';
 import { planStar, planTree, edgeKey, type Plan, type PlanNode } from './planner';
 import { chunkFrame, incrementHops, LayerDeps, readHeader, type EncodedFrame, type FrameHeader } from './protocol';
@@ -44,6 +45,11 @@ export const DRAIN_MS = 1500;
 const SETTLE_MS = 4000;
 /** Uplink queueing (median OWD increase) that counts as a saturated uplink. */
 export const UPLINK_QUEUE_MS = 40;
+/**
+ * Stricter target for a busy (gaming) broadcaster: its uplink queue is the
+ * game's ping, so a few ms of standing queue is already too much.
+ */
+export const UPLINK_QUEUE_BUSY_MS = 15;
 
 /**
  * Media channel reliability. 'split' (default) = reliable base layer +
@@ -95,6 +101,8 @@ type Ctl =
   | { t: 'unwatch'; streamId: number }
   | { t: 'assign'; streamId: number; epoch: number; parent: string; children: string[] }
   | { t: 'kf'; streamId: number }
+  /** viewer → its parent: don't send me layers above this (busy/hidden viewer). */
+  | { t: 'rxcap'; streamId: number; maxLayer: number }
   | { t: 'orphan'; streamId: number; parent: string | null }
   | ({ t: 'report'; streamId: number } & Report);
 
@@ -106,6 +114,10 @@ interface Report {
   rttMs: Record<string, number>;
   /** Viewer's own feed: highest temporal layer seen in the last second (-1 = none). */
   rxLayer: number;
+  /** Highest layer this viewer asked its parent for (below MAX when busy/hidden). */
+  rxCap: number;
+  /** Machine is busy (game, CPU pressure): not relaying. */
+  busy: boolean;
   rxFps: number;
   parent: string | null;
 }
@@ -167,6 +179,11 @@ class ChildSet {
   remove(id: string): void {
     this.active.delete(id);
     this.draining.delete(id);
+  }
+
+  setCeiling(id: string, layer: number): void {
+    const c = this.active.get(id) ?? this.draining.get(id)?.link;
+    if (c) c.ceiling = layer;
   }
 
   clear(): void {
@@ -242,11 +259,16 @@ interface Incoming {
   winMaxTl: number;
   rxLayer: number;
   rxFps: number;
+  /** Receive cap last sent, and to which parent. */
+  sentCap: number;
+  sentCapTo: string | null;
 }
 
 /** Stats snapshot for UI and the simulator. */
 export interface HubStats {
   txKbps: number;
+  /** This machine's load as last reported by the LoadMonitor. */
+  local: LocalLoad;
   inQ: Record<string, number>;
   links: Record<string, { txKbps: number; queueMs: number; maxLayer: number; rttMs: number | null }>;
   incoming: Record<
@@ -286,6 +308,9 @@ export class RelayHub {
   private owd = new OwdTracker();
   private linkTxPrev = new Map<string, number>();
   private linkTxKbps = new Map<string, number>();
+  private load: LocalLoad = { busy: false, reasons: [], critical: false, hidden: false };
+  /** Receive caps our children asked for, by `${streamId}:${childId}`. */
+  private childCaps = new Map<string, number>();
 
   constructor(
     private opts: HubOptions,
@@ -300,6 +325,48 @@ export class RelayHub {
     this.timer = null;
     if (this.out) this.stopBroadcast();
     for (const id of [...this.links.keys()]) this.detachPeer(id);
+  }
+
+  /**
+   * This machine's load changed (see load.ts). While busy we offer no relay
+   * capacity, so the broadcaster moves our children elsewhere at once; as
+   * the broadcaster we feed as few viewers directly as possible and hold our
+   * uplink queue to a gaming-grade target. Hidden or CPU-starved viewers ask
+   * their parent for fewer temporal layers (less to decode).
+   */
+  setLocalLoad(load: LocalLoad): void {
+    const was = this.load;
+    this.load = load;
+    if (was.busy !== load.busy) {
+      this.log(`local load: ${load.busy ? `busy (${load.reasons.join(', ')})` : 'calm'}`);
+      if (this.out) this.replan(load.busy ? 'broadcaster busy' : 'broadcaster calm', true);
+      this.sendReports(this.now()); // don't make the tree wait a second
+    }
+    this.syncRxCaps();
+  }
+
+  /** Relay capacity we offer right now. */
+  private get offeredKbps(): number {
+    return this.load.busy ? 0 : this.opts.uploadCapacityKbps;
+  }
+
+  /** Layers we want for our own viewing (relays always take everything). */
+  private wantedCap(inc: Incoming): number {
+    if (inc.children.active.size + inc.children.draining.size > 0) return MAX_LAYER;
+    if (this.load.hidden) return 0; // nobody is looking: 1/4 of the frames
+    if (this.load.critical) return 1; // CPU starved: half the frames
+    return MAX_LAYER;
+  }
+
+  private syncRxCaps(): void {
+    for (const inc of this.inc.values()) {
+      if (!inc.watching || !inc.parent) continue;
+      const cap = this.wantedCap(inc);
+      if (cap === inc.sentCap && inc.parent === inc.sentCapTo) continue;
+      inc.sentCap = cap;
+      inc.sentCapTo = inc.parent;
+      this.sendCtl(inc.parent, { t: 'rxcap', streamId: inc.info.streamId, maxLayer: cap });
+    }
   }
 
   setUploadCapacity(kbps: number): void {
@@ -347,7 +414,7 @@ export class RelayHub {
       }
       for (const inc of this.inc.values()) {
         if (inc.broadcasterId === peerId && inc.watching) {
-          this.sendCtl(peerId, { t: 'watch', streamId: inc.info.streamId, capKbps: this.opts.uploadCapacityKbps });
+          this.sendCtl(peerId, { t: 'watch', streamId: inc.info.streamId, capKbps: this.offeredKbps });
         }
       }
     };
@@ -484,7 +551,7 @@ export class RelayHub {
     if (!inc || inc.watching) return;
     inc.watching = true;
     inc.watchSentAt = this.now();
-    this.sendCtl(broadcasterId, { t: 'watch', streamId: inc.info.streamId, capKbps: this.opts.uploadCapacityKbps });
+    this.sendCtl(broadcasterId, { t: 'watch', streamId: inc.info.streamId, capKbps: this.offeredKbps });
   }
 
   unwatch(broadcasterId: string): void {
@@ -538,7 +605,7 @@ export class RelayHub {
         keyframes: this.keyframesSent,
       };
     }
-    return { txKbps: this.txKbps, inQ: this.owd.all(), links, incoming, outgoing };
+    return { txKbps: this.txKbps, local: this.load, inQ: this.owd.all(), links, incoming, outgoing };
   }
 
   // ---------------- internals ----------------
@@ -551,11 +618,13 @@ export class RelayHub {
     return [...this.inc.values()].find((i) => i.broadcasterId === broadcasterId);
   }
 
-  private makeChild(bitrateKbps: number) {
+  private makeChild(bitrateKbps: number, streamId: number) {
     return (id: string): ChildLink | null => {
       const l = this.links.get(id);
       if (!l) return null;
-      return new ChildLink(id, l.base as SendChannel, l.enh as SendChannel | null, { ...(this.opts.link ?? {}), bitrateKbps });
+      const c = new ChildLink(id, l.base as SendChannel, l.enh as SendChannel | null, { ...(this.opts.link ?? {}), bitrateKbps });
+      c.ceiling = this.childCaps.get(`${streamId}:${id}`) ?? MAX_LAYER;
+      return c;
     };
   }
 
@@ -602,7 +671,14 @@ export class RelayHub {
         inc.epoch = m.epoch;
         if (inc.parent !== m.parent) inc.lastParentChunkAt = this.now();
         inc.parent = m.parent;
-        inc.children.set(m.children, this.makeChild(inc.info.bitrateKbps), this.now());
+        inc.children.set(m.children, this.makeChild(inc.info.bitrateKbps, inc.info.streamId), this.now());
+        this.syncRxCaps();
+        break;
+      }
+      case 'rxcap': {
+        this.childCaps.set(`${m.streamId}:${from}`, m.maxLayer);
+        const set = this.out?.streamId === m.streamId ? this.out.children : this.inc.get(m.streamId)?.children;
+        set?.setCeiling(from, m.maxLayer);
         break;
       }
       // ----- broadcaster side -----
@@ -676,6 +752,8 @@ export class RelayHub {
       winMaxTl: -1,
       rxLayer: -1,
       rxFps: 0,
+      sentCap: MAX_LAYER,
+      sentCapTo: null,
     };
     inc.receiver = new FrameReceiver({
       now: this.now,
@@ -764,9 +842,12 @@ export class RelayHub {
     v.lastReport = r;
     v.lastReportAt = t;
     if (v.declared !== r.capKbps) {
+      const withdrawn = r.capKbps < v.estimate && (out.plan?.children.get(from)?.length ?? 0) > 0;
       v.declared = r.capKbps;
       v.estimate = r.capKbps;
       out.replanWanted = true;
+      // A relay that just started a game: move its children now.
+      if (withdrawn) this.replan(`${from} ${r.busy ? 'busy' : 'lowered its budget'}`, true);
     }
     if (wasSilent) {
       v.estimate = Math.max(v.estimate, Math.min(v.declared, out.bitrateKbps)); // back from the dead
@@ -775,7 +856,9 @@ export class RelayHub {
 
     // Is this viewer's feed degraded while its parent's uplink is fine?
     // Starving (no video at all while watching) counts as degraded too.
-    const degraded = (r.rxLayer >= 0 && r.rxLayer < MAX_LAYER) || (r.rxFps === 0 && t - v.joinedAt > 5000);
+    // A viewer that asked for fewer layers (busy / hidden) isn't degraded.
+    const wanted = Math.min(MAX_LAYER, r.rxCap ?? MAX_LAYER);
+    const degraded = (r.rxLayer >= 0 && r.rxLayer < wanted) || (r.rxFps === 0 && t - v.joinedAt > 5000);
     if (!degraded) {
       v.degradedSince = null;
       return;
@@ -872,6 +955,8 @@ export class RelayHub {
             prevParent,
             forbidden: new Set(out.forbidden.keys()),
             noRelay,
+            // Busy broadcaster: feed one viewer and let the tree do the rest.
+            ...(this.load.busy ? { rootMaxSlots: 1 } : {}),
             ...this.opts.planner,
           });
     const prevChildren = out.plan?.children ?? new Map<string, string[]>();
@@ -882,7 +967,7 @@ export class RelayHub {
     const sameKids = (a: string[], b: string[]) => a.length === b.length && a.every((c) => b.includes(c));
     const mine = plan.children.get(this.opts.myId) ?? [];
     if (!sameKids(mine, prevChildren.get(this.opts.myId) ?? [])) out.self.settleUntil = t + SETTLE_MS;
-    out.children.set(mine, this.makeChild(out.bitrateKbps), t);
+    out.children.set(mine, this.makeChild(out.bitrateKbps, out.streamId), t);
     for (const v of live) {
       const id = v.id;
       const parent = plan.parent.get(id);
@@ -937,27 +1022,14 @@ export class RelayHub {
     }
     this.linkTxPrev = perLink;
 
-    const rtt: Record<string, number> = {};
-    for (const [id, l] of this.links) if (l.rttMs != null) rtt[id] = Math.round(l.rttMs);
-    const inQ = this.owd.all();
     for (const inc of this.inc.values()) {
       inc.rxFps = inc.winFrames;
       inc.rxLayer = inc.winMaxTl;
       inc.winFrames = 0;
       inc.winMaxTl = -1;
-      if (!inc.watching) continue;
-      this.sendCtl(inc.broadcasterId, {
-        t: 'report',
-        streamId: inc.info.streamId,
-        capKbps: this.opts.uploadCapacityKbps,
-        txKbps: this.txKbps,
-        inQ,
-        rttMs: rtt,
-        rxLayer: inc.rxLayer,
-        rxFps: inc.rxFps,
-        parent: inc.parent,
-      });
     }
+    this.syncRxCaps(); // becoming / ceasing to be a relay changes what we need
+    this.sendReports(t);
 
     const out = this.out;
     if (!out) return;
@@ -965,21 +1037,21 @@ export class RelayHub {
     // uplink means it is asked for more than it can send. Cut its estimate to
     // what it actually sustained.
     const step = out.bitrateKbps;
-    const check = (id: string, c: CapState, txKbps: number) => {
+    const check = (id: string, c: CapState, txKbps: number, limitMs = UPLINK_QUEUE_MS) => {
       const q = this.uplinkQueue(id);
       // After a cut, give the re-plan time to drain the queue before judging
       // again; after a change of children, let their join keyframes drain.
       if (t - c.lastCutAt < 3000 || t < c.settleUntil) return;
-      if (q !== null && q > UPLINK_QUEUE_MS && txKbps > 0) {
+      if (q !== null && q > limitMs && txKbps > 0) {
         // Multiplicative decrease, floored at what it demonstrably sent: the
         // measured send rate alone undershoots badly while SCTP is backing off.
         const to = Math.max(txKbps * 0.9, c.estimate * 0.5);
         if (to < c.estimate * 0.95) this.cut(c, to, id, `uplink queue ${Math.round(q)} ms`);
-      } else if (q === null || q < UPLINK_QUEUE_MS / 4) {
+      } else if (q === null || q < limitMs / 4) {
         this.recover(c, t, step);
       }
     };
-    check(this.opts.myId, out.self, this.txKbps);
+    check(this.opts.myId, out.self, this.txKbps, this.load.busy ? UPLINK_QUEUE_BUSY_MS : UPLINK_QUEUE_MS);
     for (const v of out.viewers.values()) {
       if (v.lastReport && t - v.lastReportAt < 3000) check(v.id, v, v.lastReport.txKbps);
       // Stopped reporting (crash / network loss) while still feeding someone:
@@ -988,6 +1060,28 @@ export class RelayHub {
         this.log(`${v.id} stopped reporting; not using it as a relay`);
         out.replanWanted = true;
       }
+    }
+  }
+
+  private sendReports(_t: number): void {
+    const rtt: Record<string, number> = {};
+    for (const [id, l] of this.links) if (l.rttMs != null) rtt[id] = Math.round(l.rttMs);
+    const inQ = this.owd.all();
+    for (const inc of this.inc.values()) {
+      if (!inc.watching) continue;
+      this.sendCtl(inc.broadcasterId, {
+        t: 'report',
+        streamId: inc.info.streamId,
+        capKbps: this.offeredKbps,
+        txKbps: this.txKbps,
+        inQ,
+        rttMs: rtt,
+        rxLayer: inc.rxLayer,
+        rxCap: inc.sentCap,
+        rxFps: inc.rxFps,
+        parent: inc.parent,
+        busy: this.load.busy,
+      });
     }
   }
 
